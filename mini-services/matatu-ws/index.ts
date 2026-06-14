@@ -245,6 +245,21 @@ io.on("connection", (socket) => {
     }
   );
 
+  // GPS location update
+  socket.on(
+    "gps_update",
+    (data: { busId: string; lat: number; lng: number; speed: number; heading: number }) => {
+      const gpsPoint = {
+        lat: data.lat,
+        lng: data.lng,
+        speed: data.speed,
+        heading: data.heading,
+        timestamp: new Date().toISOString(),
+      };
+      io.to(`bus_${data.busId}`).emit("gps_update", gpsPoint);
+    }
+  );
+
   socket.on("disconnect", () => {
     console.log(`[WS] Client disconnected: ${socket.id}`);
   });

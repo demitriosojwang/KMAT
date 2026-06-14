@@ -1,5 +1,6 @@
 'use client'
 
+import dynamic from 'next/dynamic'
 import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { io, Socket } from 'socket.io-client'
@@ -99,6 +100,24 @@ interface WSNotification {
   read: boolean
 }
 
+interface GPSLocation {
+  lat: number
+  lng: number
+  speed: number
+  heading: number
+  timestamp: string
+}
+
+interface GPSData {
+  routeStops: Array<{ lat: number; lng: number; stopName: string; order: number }>
+  routeLine: Array<{ lat: number; lng: number }>
+  currentLocation: GPSLocation
+  speed: number
+  heading: number
+  lastUpdated: string
+  gpsHistory: GPSLocation[]
+}
+
 // ─── Color helpers ────────────────────────────────────────────────
 const PAYMENT_COLORS: Record<string, string> = {
   mpesa: '#16a34a',
@@ -125,6 +144,28 @@ function getSeatColor(seat: Seat, currentStopIndex: number): string {
   return SEAT_COLORS.occupiedFar
 }
 
+// ─── Dynamic Leaflet Imports (SSR-safe) ──────────────────────────
+const MapContainer = dynamic(
+  () => import('react-leaflet').then(mod => mod.MapContainer),
+  { ssr: false, loading: () => <div style={{ height: '300px', background: '#f0fdf4', borderRadius: '8px' }} className="flex items-center justify-center text-emerald-600 text-sm">Loading map...</div> }
+)
+const TileLayer = dynamic(
+  () => import('react-leaflet').then(mod => mod.TileLayer),
+  { ssr: false }
+)
+const Marker = dynamic(
+  () => import('react-leaflet').then(mod => mod.Marker),
+  { ssr: false }
+)
+const Popup = dynamic(
+  () => import('react-leaflet').then(mod => mod.Popup),
+  { ssr: false }
+)
+const Polyline = dynamic(
+  () => import('react-leaflet').then(mod => mod.Polyline),
+  { ssr: false }
+)
+
 // ─── Main Component ───────────────────────────────────────────────
 type TabType = 'passenger' | 'conductor' | 'driver' | 'owner'
 
@@ -134,6 +175,7 @@ export default function Home() {
   const [tripData, setTripData] = useState<TripData | null>(null)
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [notifications, setNotifications] = useState<WSNotification[]>([])
+  const [gpsData, setGpsData] = useState<GPSData | null>(null)
   const [loading, setLoading] = useState(true)
   const socketRef = useRef<Socket | null>(null)
 
@@ -164,6 +206,16 @@ export default function Home() {
     }
   }, [])
 
+  const fetchGpsData = useCallback(async () => {
+    try {
+      const res = await fetch('/api/gps')
+      const data = await res.json()
+      setGpsData(data)
+    } catch (e) {
+      console.error('Failed to fetch GPS data', e)
+    }
+  }, [])
+
   // ─── Socket emit helpers (access ref in callbacks, not during render) ─
   const emitSocket = useCallback((event: string, data: any) => {
     socketRef.current?.emit(event, data)
@@ -174,10 +226,11 @@ export default function Home() {
     const load = async () => {
       setLoading(true)
       await fetchBusData()
+      await fetchGpsData()
       setLoading(false)
     }
     load()
-  }, [fetchBusData])
+  }, [fetchBusData, fetchGpsData])
 
   // ─── WebSocket ────────────────────────────────────────────────
   useEffect(() => {
@@ -237,6 +290,17 @@ export default function Home() {
       } else if (notif.type === 'payment_alert') {
         toast.error(`⚠️ ${notif.message}`)
       }
+    })
+
+    socket.on('gps_update', (data: { busId: string; lat: number; lng: number; speed: number; heading: number; timestamp: string }) => {
+      setGpsData(prev => prev ? {
+        ...prev,
+        currentLocation: { lat: data.lat, lng: data.lng, speed: data.speed, heading: data.heading, timestamp: data.timestamp },
+        speed: data.speed,
+        heading: data.heading,
+        lastUpdated: data.timestamp,
+        gpsHistory: [...prev.gpsHistory, { lat: data.lat, lng: data.lng, speed: data.speed, heading: data.heading, timestamp: data.timestamp }].slice(-20),
+      } : prev)
     })
 
     return () => {
@@ -367,6 +431,7 @@ export default function Home() {
                 stops={stops}
                 seats={seats}
                 currentStopIndex={currentStopIndex}
+                gpsData={gpsData}
                 emitSocket={emitSocket}
                 onRefresh={fetchBusData}
               />
@@ -391,9 +456,11 @@ export default function Home() {
                 seats={seats}
                 currentStopIndex={currentStopIndex}
                 passengersOnBoard={passengersOnBoard}
+                gpsData={gpsData}
                 emitSocket={emitSocket}
                 notifications={notifications}
                 onRefresh={() => { fetchBusData(); fetchTripData() }}
+                fetchGpsData={fetchGpsData}
               />
             )}
             {activeTab === 'owner' && (
@@ -404,6 +471,7 @@ export default function Home() {
                 seats={seats}
                 currentStopIndex={currentStopIndex}
                 transactions={transactions}
+                gpsData={gpsData}
                 onRefresh={() => { fetchBusData() }}
                 onReset={handleReset}
               />
@@ -438,6 +506,7 @@ function PassengerPanel({
   stops,
   seats,
   currentStopIndex,
+  gpsData,
   emitSocket,
   onRefresh,
 }: {
@@ -446,6 +515,7 @@ function PassengerPanel({
   stops: Stop[]
   seats: Seat[]
   currentStopIndex: number
+  gpsData: GPSData | null
   emitSocket: (event: string, data: any) => void
   onRefresh: () => void
 }) {
@@ -569,6 +639,60 @@ function PassengerPanel({
         <h2 className="text-2xl font-bold text-emerald-800">Welcome aboard! 🚌</h2>
         <p className="text-gray-500 mt-1">Select your seat and destination</p>
       </div>
+
+      {/* Route Progress Tracker */}
+      <Card className="bg-gradient-to-r from-emerald-50 to-teal-50 border-emerald-200">
+        <CardContent className="p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Navigation className="w-4 h-4 text-emerald-600" />
+            <span className="text-sm font-semibold text-emerald-800">Route Progress</span>
+          </div>
+          <div className="relative flex items-center justify-between gap-1">
+            {/* Connecting line */}
+            <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-gray-200 -translate-y-1/2" />
+            <div
+              className="absolute top-1/2 left-0 h-0.5 bg-emerald-500 -translate-y-1/2 transition-all duration-500"
+              style={{ width: `${stops.length > 1 ? (currentStopIndex / (stops.length - 1)) * 100 : 0}%` }}
+            />
+            {/* Stop dots */}
+            {stops.map((stop, i) => (
+              <div key={stop.id} className="relative flex flex-col items-center z-10">
+                <div
+                  className={`w-4 h-4 rounded-full border-2 transition-all duration-300 ${
+                    i < currentStopIndex
+                      ? 'bg-emerald-500 border-emerald-500'
+                      : i === currentStopIndex
+                      ? 'bg-emerald-500 border-emerald-600 ring-2 ring-emerald-300 scale-125'
+                      : 'bg-white border-gray-300'
+                  }`}
+                >
+                  {i === currentStopIndex && (
+                    <span className="absolute -top-5 left-1/2 -translate-x-1/2 text-xs">🚌</span>
+                  )}
+                </div>
+                <span
+                  className={`text-[9px] mt-1 max-w-[40px] text-center leading-tight truncate ${
+                    i === currentStopIndex ? 'font-bold text-emerald-700' : 'text-gray-400'
+                  }`}
+                >
+                  {stop.name.split(' ')[0]}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center justify-center gap-2 mt-3">
+            <span className="text-xs text-gray-500">Current:</span>
+            <Badge variant="default" className="bg-emerald-600 text-xs">
+              {stops[currentStopIndex]?.name || 'Unknown'}
+            </Badge>
+            {gpsData && gpsData.speed > 0 && (
+              <span className="text-xs text-emerald-600 font-medium">
+                • {gpsData.speed} km/h
+              </span>
+            )}
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Step indicators */}
       <div className="flex items-center justify-center gap-2">
@@ -1333,9 +1457,11 @@ function DriverPanel({
   seats,
   currentStopIndex,
   passengersOnBoard,
+  gpsData,
   emitSocket,
   notifications,
   onRefresh,
+  fetchGpsData,
 }: {
   busData: BusData | null
   tripData: TripData | null
@@ -1343,11 +1469,15 @@ function DriverPanel({
   seats: Seat[]
   currentStopIndex: number
   passengersOnBoard: Passenger[]
+  gpsData: GPSData | null
   emitSocket: (event: string, data: any) => void
   notifications: WSNotification[]
   onRefresh: () => void
+  fetchGpsData: () => void
 }) {
   const [advancing, setAdvancing] = useState(false)
+  const [gpsTracking, setGpsTracking] = useState(false)
+  const gpsIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
   const currentStop = stops[currentStopIndex]
   const nextStop = stops[currentStopIndex + 1]
@@ -1391,6 +1521,103 @@ function DriverPanel({
     }
     setAdvancing(false)
   }
+
+  // ─── GPS Tracking ─────────────────────────────────────────────
+  const ROUTE_STOPS_GPS = [
+    { lat: -4.0753, lng: 39.6672 },
+    { lat: -4.0710, lng: 39.6740 },
+    { lat: -4.0550, lng: 39.6850 },
+    { lat: -4.0450, lng: 39.7000 },
+    { lat: -4.0380, lng: 39.7100 },
+    { lat: -4.0300, lng: 39.7200 },
+    { lat: -4.0250, lng: 39.7280 },
+    { lat: -4.0180, lng: 39.7350 },
+    { lat: -4.0050, lng: 39.7450 },
+    { lat: -4.0500, lng: 39.6700 },
+  ]
+
+  const sendGpsUpdate = useCallback(async (lat: number, lng: number, speed: number, heading: number) => {
+    try {
+      await fetch('/api/gps', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lat, lng, speed, heading, busId: busData?.id || 'demo-bus' }),
+      })
+      if (busData?.id) {
+        emitSocket('gps_update', {
+          busId: busData.id,
+          lat,
+          lng,
+          speed,
+          heading,
+        })
+      }
+      fetchGpsData()
+    } catch {
+      console.error('Failed to send GPS update')
+    }
+  }, [busData, emitSocket, fetchGpsData])
+
+  const startGpsTracking = useCallback(() => {
+    if (gpsTracking) return
+    setGpsTracking(true)
+    toast.success('📍 GPS tracking started')
+
+    const sendLocation = () => {
+      // Try real geolocation first
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            sendGpsUpdate(pos.coords.latitude, pos.coords.longitude, pos.coords.speed ? pos.coords.speed * 3.6 : Math.round(20 + Math.random() * 30), pos.coords.heading || Math.round(Math.random() * 360))
+          },
+          () => {
+            // Fallback: simulated coordinates
+            const idx = Math.min(currentStopIndex, ROUTE_STOPS_GPS.length - 1)
+            const nextIdx = Math.min(idx + 1, ROUTE_STOPS_GPS.length - 1)
+            const t = Math.random() * 0.3
+            const lat = ROUTE_STOPS_GPS[idx].lat + (ROUTE_STOPS_GPS[nextIdx].lat - ROUTE_STOPS_GPS[idx].lat) * t + (Math.random() - 0.5) * 0.001
+            const lng = ROUTE_STOPS_GPS[idx].lng + (ROUTE_STOPS_GPS[nextIdx].lng - ROUTE_STOPS_GPS[idx].lng) * t + (Math.random() - 0.5) * 0.001
+            const speed = Math.round(20 + Math.random() * 30)
+            const heading = Math.round(Math.random() * 360)
+            sendGpsUpdate(lat, lng, speed, heading)
+          },
+          { timeout: 3000 }
+        )
+      } else {
+        // No geolocation API: use simulated
+        const idx = Math.min(currentStopIndex, ROUTE_STOPS_GPS.length - 1)
+        const nextIdx = Math.min(idx + 1, ROUTE_STOPS_GPS.length - 1)
+        const t = Math.random() * 0.3
+        const lat = ROUTE_STOPS_GPS[idx].lat + (ROUTE_STOPS_GPS[nextIdx].lat - ROUTE_STOPS_GPS[idx].lat) * t + (Math.random() - 0.5) * 0.001
+        const lng = ROUTE_STOPS_GPS[idx].lng + (ROUTE_STOPS_GPS[nextIdx].lng - ROUTE_STOPS_GPS[idx].lng) * t + (Math.random() - 0.5) * 0.001
+        const speed = Math.round(20 + Math.random() * 30)
+        const heading = Math.round(Math.random() * 360)
+        sendGpsUpdate(lat, lng, speed, heading)
+      }
+    }
+
+    // Send immediately, then every 5 seconds
+    sendLocation()
+    gpsIntervalRef.current = setInterval(sendLocation, 5000)
+  }, [gpsTracking, currentStopIndex, sendGpsUpdate])
+
+  const stopGpsTracking = useCallback(() => {
+    setGpsTracking(false)
+    if (gpsIntervalRef.current) {
+      clearInterval(gpsIntervalRef.current)
+      gpsIntervalRef.current = null
+    }
+    toast.info('GPS tracking stopped')
+  }, [])
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (gpsIntervalRef.current) {
+        clearInterval(gpsIntervalRef.current)
+      }
+    }
+  }, [])
 
   return (
     <div className="space-y-6">
@@ -1444,6 +1671,64 @@ function DriverPanel({
           </CardContent>
         </Card>
       )}
+
+      {/* GPS Tracking Control */}
+      <Card className="border-emerald-300 bg-emerald-50/30">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-lg flex items-center gap-2">
+            <MapPin className="w-5 h-5 text-emerald-600" />
+            GPS Tracking
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex items-center gap-3">
+            {gpsTracking ? (
+              <Button
+                onClick={stopGpsTracking}
+                variant="destructive"
+                className="flex-1"
+              >
+                <span className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+                  Stop Tracking
+                </span>
+              </Button>
+            ) : (
+              <Button
+                onClick={startGpsTracking}
+                className="bg-emerald-600 hover:bg-emerald-700 flex-1"
+              >
+                <Navigation className="w-4 h-4 mr-2" />
+                Start GPS Tracking
+              </Button>
+            )}
+          </div>
+          {gpsData && (
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div className="bg-white rounded-lg p-2 border">
+                <p className="text-xs text-gray-500">Speed</p>
+                <p className="font-bold text-emerald-700">{gpsData.speed || 0} <span className="text-xs font-normal">km/h</span></p>
+              </div>
+              <div className="bg-white rounded-lg p-2 border">
+                <p className="text-xs text-gray-500">Heading</p>
+                <p className="font-bold text-emerald-700">{gpsData.heading || 0}°</p>
+              </div>
+              <div className="bg-white rounded-lg p-2 border">
+                <p className="text-xs text-gray-500">Updated</p>
+                <p className="font-bold text-emerald-700 text-xs">
+                  {gpsData.lastUpdated ? new Date(gpsData.lastUpdated).toLocaleTimeString() : 'N/A'}
+                </p>
+              </div>
+            </div>
+          )}
+          {gpsTracking && (
+            <div className="flex items-center gap-2 text-xs text-emerald-600">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span>Live tracking active — updating every 5s</span>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Counters */}
       <div className="grid grid-cols-2 gap-4">
@@ -1546,6 +1831,7 @@ function OwnerPanel({
   seats,
   currentStopIndex,
   transactions,
+  gpsData,
   onRefresh,
   onReset,
 }: {
@@ -1555,10 +1841,38 @@ function OwnerPanel({
   seats: Seat[]
   currentStopIndex: number
   transactions: Transaction[]
+  gpsData: GPSData | null
   onRefresh: () => void
   onReset: () => void
 }) {
   const [ownerData, setOwnerData] = useState<any>(null)
+  const [leafletReady, setLeafletReady] = useState(false)
+
+  // Load Leaflet CSS + fix icons on client side
+  useEffect(() => {
+    if (typeof window !== 'undefined' && !leafletReady) {
+      // Add Leaflet CSS via link tag if not already present
+      if (!document.querySelector('link[href*="leaflet"]')) {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css'
+        document.head.appendChild(link)
+      }
+      // Fix default marker icons
+      import('leaflet').then((L) => {
+        delete (L.Icon.Default.prototype as any)._getIconUrl
+        L.Icon.Default.mergeOptions({
+          iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
+          iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
+          shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
+        })
+        setLeafletReady(true)
+      }).catch(() => {
+        // Leaflet not available yet, retry
+        setTimeout(() => setLeafletReady(false), 1000)
+      })
+    }
+  }, [leafletReady])
 
   useEffect(() => {
     const fetchOwner = async () => {
@@ -1633,6 +1947,48 @@ function OwnerPanel({
 
   return (
     <div className="space-y-6">
+      {/* Live Bus Tracking Map */}
+      {typeof window !== 'undefined' && leafletReady && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-lg flex items-center gap-2">
+              <MapPin className="w-5 h-5 text-emerald-600" />
+              Live Bus Tracking
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div style={{ height: '300px', borderRadius: '8px', overflow: 'hidden' }}>
+              <MapContainer center={[-4.05, 39.67]} zoom={12} style={{ height: '100%', width: '100%' }} scrollWheelZoom={false}>
+                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' />
+                <Polyline positions={gpsData?.routeLine.map(p => [p.lat, p.lng]) || []} color="#059669" weight={3} />
+                {gpsData?.routeStops.map(stop => (
+                  <Marker key={stop.order} position={[stop.lat, stop.lng]}>
+                    <Popup>{stop.stopName}</Popup>
+                  </Marker>
+                ))}
+                {gpsData?.currentLocation && (
+                  <Marker position={[gpsData.currentLocation.lat, gpsData.currentLocation.lng]}>
+                    <Popup>🚌 Bus — {gpsData.speed} km/h</Popup>
+                  </Marker>
+                )}
+              </MapContainer>
+            </div>
+            <div className="flex items-center gap-4 mt-3 text-sm text-gray-600">
+              <span className="flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                Speed: {gpsData?.speed || 0} km/h
+              </span>
+              <span>Updated: {gpsData?.lastUpdated ? new Date(gpsData.lastUpdated).toLocaleTimeString() : 'N/A'}</span>
+              {gpsData?.currentLocation && (
+                <span className="text-xs text-gray-400">
+                  ({gpsData.currentLocation.lat.toFixed(4)}, {gpsData.currentLocation.lng.toFixed(4)})
+                </span>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Revenue Overview Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
         <Card className="bg-gradient-to-br from-emerald-500 to-emerald-700 text-white">
