@@ -166,6 +166,20 @@ const Polyline = dynamic(
   { ssr: false }
 )
 
+// Static import for useMap hook (must NOT be dynamic, since it's a hook)
+import { useMap as useLeafletMap } from 'react-leaflet'
+
+// Component that recenters the map when bus position changes
+function MapRecenter({ position }: { position: [number, number] | null }) {
+  const map = useLeafletMap()
+  useEffect(() => {
+    if (map && position) {
+      try { map.panTo(position, { animate: true, duration: 0.8 }) } catch {}
+    }
+  }, [map, position])
+  return null
+}
+
 // ─── Main Component ───────────────────────────────────────────────
 type TabType = 'passenger' | 'conductor' | 'driver' | 'owner'
 
@@ -531,6 +545,33 @@ function PassengerPanel({
   const selectedStopData = stops.find(s => s.name === selectedStop)
   const fare = selectedStopData ? (selectedStopData.order - (currentStopIndex + 1)) * 20 + 30 : 0
 
+  // Leaflet state for mini tracker (must be before any early return)
+  const [miniLeafletReady, setMiniLeafletReady] = useState(false)
+  const [showMiniMap, setShowMiniMap] = useState(false)
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && showMiniMap && !miniLeafletReady) {
+      if (!document.querySelector('link[data-leaflet]')) {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css'
+        link.setAttribute('data-leaflet', 'true')
+        document.head.appendChild(link)
+      }
+      import('leaflet').then((L) => {
+        delete (L.Icon.Default.prototype as any)._getIconUrl
+        L.Icon.Default.mergeOptions({
+          iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
+          iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
+          shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
+        })
+        setMiniLeafletReady(true)
+      }).catch(() => {
+        setTimeout(() => setShowMiniMap(false), 1000)
+      })
+    }
+  }, [showMiniMap, miniLeafletReady])
+
   const handleSeatClick = (seatNum: number) => {
     const seat = seats.find(s => s.number === seatNum)
     if (seat && !seat.isOccupied) {
@@ -632,6 +673,16 @@ function PassengerPanel({
     )
   }
 
+  // Compute ETA to passenger's selected alighting stop
+  const etaMinutes = (() => {
+    if (!gpsData?.speed || gpsData.speed < 5) return null
+    if (!selectedStopData) return null
+    const stopsToGo = selectedStopData.order - (currentStopIndex + 1)
+    if (stopsToGo <= 0) return 0
+    // ~3 minutes per stop on average
+    return Math.max(1, Math.round(stopsToGo * 3 - (stopsToGo * 3 * 0.2)))
+  })()
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -639,6 +690,95 @@ function PassengerPanel({
         <h2 className="text-2xl font-bold text-emerald-800">Welcome aboard! 🚌</h2>
         <p className="text-gray-500 mt-1">Select your seat and destination</p>
       </div>
+
+      {/* Mini Live Bus Tracker */}
+      <Card className="border-emerald-200 bg-gradient-to-br from-emerald-50 to-teal-50">
+        <CardHeader className="pb-2">
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base flex items-center gap-2 text-emerald-800">
+              <Navigation className="w-4 h-4 text-emerald-600" />
+              Live Bus Tracker
+            </CardTitle>
+            <button
+              onClick={() => setShowMiniMap(s => !s)}
+              className="text-xs text-emerald-600 hover:text-emerald-800 underline"
+            >
+              {showMiniMap ? 'Hide map' : 'Show map'}
+            </button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {/* GPS status row */}
+          <div className="flex items-center gap-3 flex-wrap text-xs">
+            <span className="flex items-center gap-1.5 px-2 py-1 rounded-full bg-white border border-emerald-200">
+              <span className={`w-2 h-2 rounded-full ${gpsData?.speed ? 'bg-emerald-500 animate-pulse' : 'bg-gray-300'}`} />
+              {gpsData?.speed ? 'Live' : 'Waiting'}
+            </span>
+            {gpsData?.speed !== undefined && (
+              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-emerald-200">
+                <span className="text-emerald-600 font-bold">{gpsData.speed}</span>
+                <span className="text-gray-500">km/h</span>
+              </span>
+            )}
+            {gpsData?.currentLocation && (
+              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-emerald-200 text-gray-500">
+                {gpsData.currentLocation.lat.toFixed(4)}, {gpsData.currentLocation.lng.toFixed(4)}
+              </span>
+            )}
+            {etaMinutes !== null && (
+              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-amber-100 border border-amber-300 text-amber-700 font-medium">
+                ETA: ~{etaMinutes} min to {selectedStopData?.name?.split(' ')[0] || 'stop'}
+              </span>
+            )}
+          </div>
+
+          {/* Mini map */}
+          {showMiniMap && typeof window !== 'undefined' && miniLeafletReady && (
+            <div style={{ height: '180px', borderRadius: '8px', overflow: 'hidden', border: '1px solid #d1d5db' }}>
+              <MapContainer
+                center={gpsData?.currentLocation ? [gpsData.currentLocation.lat, gpsData.currentLocation.lng] : [-4.05, 39.67]}
+                zoom={13}
+                style={{ height: '100%', width: '100%' }}
+                scrollWheelZoom={false}
+                zoomControl={false}
+              >
+                <MapRecenter position={gpsData?.currentLocation ? [gpsData.currentLocation.lat, gpsData.currentLocation.lng] : null} />
+                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+                <Polyline positions={gpsData?.routeLine?.map(p => [p.lat, p.lng]) || []} color="#059669" weight={3} opacity={0.6} />
+                {gpsData?.routeStops?.slice(currentStopIndex, currentStopIndex + 3).map(stop => (
+                  <Marker key={stop.order} position={[stop.lat, stop.lng]}>
+                    <Popup>{stop.stopName}</Popup>
+                  </Marker>
+                ))}
+                {gpsData?.currentLocation && (
+                  <Marker position={[gpsData.currentLocation.lat, gpsData.currentLocation.lng]}>
+                    <Popup>🚌 Your bus — {gpsData.speed} km/h</Popup>
+                  </Marker>
+                )}
+              </MapContainer>
+            </div>
+          )}
+
+          {/* Next stop callout */}
+          <div className="flex items-center gap-2 text-xs text-emerald-700 bg-white/60 rounded-lg p-2">
+            <MapPin className="w-3.5 h-3.5 shrink-0" />
+            <span>
+              {gpsData?.currentLocation ? 'Now approaching ' : 'Currently at '}
+              <strong>{stops[currentStopIndex]?.name || 'Unknown'}</strong>
+              {stops[currentStopIndex + 1] && (
+                <> • Next: <strong>{stops[currentStopIndex + 1].name}</strong></>
+              )}
+            </span>
+          </div>
+
+          {/* Last updated */}
+          {gpsData?.lastUpdated && (
+            <p className="text-[10px] text-gray-400 text-right">
+              Updated {new Date(gpsData.lastUpdated).toLocaleTimeString()}
+            </p>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Route Progress Tracker */}
       <Card className="bg-gradient-to-r from-emerald-50 to-teal-50 border-emerald-200">
@@ -1951,40 +2091,93 @@ function OwnerPanel({
       {typeof window !== 'undefined' && leafletReady && (
         <Card>
           <CardHeader className="pb-3">
-            <CardTitle className="text-lg flex items-center gap-2">
-              <MapPin className="w-5 h-5 text-emerald-600" />
-              Live Bus Tracking
-            </CardTitle>
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <CardTitle className="text-lg flex items-center gap-2">
+                <MapPin className="w-5 h-5 text-emerald-600" />
+                Live Bus Tracking
+                <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 ml-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1" />
+                  {gpsData?.speed ? 'Moving' : 'Idle'}
+                </Badge>
+              </CardTitle>
+              <div className="flex items-center gap-3 text-xs text-gray-500">
+                <span>Bus: <strong className="text-emerald-700">{busData?.registrationNumber || 'KBA 234J'}</strong></span>
+                <span>Route: <strong className="text-emerald-700">{busData?.route?.name?.split('→')[0]?.trim() || 'Likoni'}</strong></span>
+              </div>
+            </div>
           </CardHeader>
           <CardContent>
-            <div style={{ height: '300px', borderRadius: '8px', overflow: 'hidden' }}>
-              <MapContainer center={[-4.05, 39.67]} zoom={12} style={{ height: '100%', width: '100%' }} scrollWheelZoom={false}>
+            <div style={{ height: '340px', borderRadius: '8px', overflow: 'hidden' }}>
+              <MapContainer
+                center={gpsData?.currentLocation ? [gpsData.currentLocation.lat, gpsData.currentLocation.lng] : [-4.05, 39.67]}
+                zoom={13}
+                style={{ height: '100%', width: '100%' }}
+                scrollWheelZoom={false}
+              >
+                <MapRecenter position={gpsData?.currentLocation ? [gpsData.currentLocation.lat, gpsData.currentLocation.lng] : null} />
                 <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' />
-                <Polyline positions={gpsData?.routeLine.map(p => [p.lat, p.lng]) || []} color="#059669" weight={3} />
-                {gpsData?.routeStops.map(stop => (
+                {/* Full route line */}
+                <Polyline positions={gpsData?.routeLine?.map(p => [p.lat, p.lng]) || []} color="#10b981" weight={4} opacity={0.5} />
+                {/* Recent trail (last 20 points) */}
+                {gpsData?.gpsHistory && gpsData.gpsHistory.length > 1 && (
+                  <Polyline
+                    positions={gpsData.gpsHistory.map(p => [p.lat, p.lng])}
+                    pathOptions={{ color: '#059669', weight: 3, dashArray: '6,4' }}
+                  />
+                )}
+                {/* All route stops */}
+                {gpsData?.routeStops?.map(stop => (
                   <Marker key={stop.order} position={[stop.lat, stop.lng]}>
-                    <Popup>{stop.stopName}</Popup>
+                    <Popup>
+                      <strong>{stop.stopName}</strong><br />
+                      Stop #{stop.order}
+                    </Popup>
                   </Marker>
                 ))}
+                {/* Live bus marker */}
                 {gpsData?.currentLocation && (
                   <Marker position={[gpsData.currentLocation.lat, gpsData.currentLocation.lng]}>
-                    <Popup>🚌 Bus — {gpsData.speed} km/h</Popup>
+                    <Popup>
+                      <strong>🚌 {busData?.name || 'MatatuLink Bus'}</strong><br />
+                      Reg: {busData?.registrationNumber || 'KBA 234J'}<br />
+                      Speed: {gpsData.speed} km/h<br />
+                      Heading: {gpsData.heading}°<br />
+                      Updated: {new Date(gpsData.lastUpdated).toLocaleTimeString()}
+                    </Popup>
                   </Marker>
                 )}
               </MapContainer>
             </div>
-            <div className="flex items-center gap-4 mt-3 text-sm text-gray-600">
-              <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                Speed: {gpsData?.speed || 0} km/h
-              </span>
-              <span>Updated: {gpsData?.lastUpdated ? new Date(gpsData.lastUpdated).toLocaleTimeString() : 'N/A'}</span>
-              {gpsData?.currentLocation && (
-                <span className="text-xs text-gray-400">
-                  ({gpsData.currentLocation.lat.toFixed(4)}, {gpsData.currentLocation.lng.toFixed(4)})
-                </span>
-              )}
+
+            {/* Telemetry strip */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
+              <div className="bg-emerald-50 rounded-lg p-2 text-center border border-emerald-200">
+                <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Speed</p>
+                <p className="font-bold text-emerald-800 text-sm">{gpsData?.speed || 0} <span className="text-[10px] font-normal">km/h</span></p>
+              </div>
+              <div className="bg-emerald-50 rounded-lg p-2 text-center border border-emerald-200">
+                <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Heading</p>
+                <p className="font-bold text-emerald-800 text-sm">{gpsData?.heading || 0}°</p>
+              </div>
+              <div className="bg-emerald-50 rounded-lg p-2 text-center border border-emerald-200">
+                <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Last Ping</p>
+                <p className="font-bold text-emerald-800 text-sm">
+                  {gpsData?.lastUpdated ? new Date(gpsData.lastUpdated).toLocaleTimeString() : 'N/A'}
+                </p>
+              </div>
+              <div className="bg-emerald-50 rounded-lg p-2 text-center border border-emerald-200">
+                <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Trail Points</p>
+                <p className="font-bold text-emerald-800 text-sm">{gpsData?.historyCount || 0}</p>
+              </div>
             </div>
+
+            {/* Coordinates row */}
+            {gpsData?.currentLocation && (
+              <div className="flex items-center gap-4 mt-2 text-xs text-gray-500 justify-center">
+                <span>Lat: <strong>{gpsData.currentLocation.lat.toFixed(5)}</strong></span>
+                <span>Lng: <strong>{gpsData.currentLocation.lng.toFixed(5)}</strong></span>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}
