@@ -1,0 +1,682 @@
+   940→function PassengerPanel({
+   941→  busData,
+   942→  tripData,
+   943→  stops,
+   944→  seats,
+   945→  currentStopIndex,
+   946→  gpsData,
+   947→  emitSocket,
+   948→  onRefresh,
+   949→}: {
+   950→  busData: BusData | null
+   951→  tripData: TripData | null
+   952→  stops: Stop[]
+   953→  seats: Seat[]
+   954→  currentStopIndex: number
+   955→  gpsData: GPSData | null
+   956→  emitSocket: (event: string, data: any) => void
+   957→  onRefresh: () => void
+   958→}) {
+   959→  const [step, setStep] = useState(1)
+   960→  const [selectedSeat, setSelectedSeat] = useState<number | null>(null)
+   961→  const [selectedStop, setSelectedStop] = useState<string>('')
+   962→  const [customStop, setCustomStop] = useState('')
+   963→  const [paymentMethod, setPaymentMethod] = useState<string>('')
+   964→  const [mpesaPhone, setMpesaPhone] = useState('')
+   965→  const [processing, setProcessing] = useState(false)
+   966→  const [confirmed, setConfirmed] = useState(false)
+   967→
+   968→  const selectedStopData = stops.find(s => s.name === selectedStop)
+   969→  // Fare matrix: fare = (alightingStop.fareFromOrigin) − (boardingStop.fareFromOrigin).
+   970→  // For custom (free-text) alighting, default to the last stop's fare.
+   971→  const usingCustom = customStop.trim().length > 0
+   972→  const fare = computeFare(stops, currentStopIndex, usingCustom ? null : selectedStop, usingCustom)
+   973→
+   974→  // Leaflet state for mini tracker (must be before any early return)
+   975→  const [miniLeafletReady, setMiniLeafletReady] = useState(false)
+   976→  const [showMiniMap, setShowMiniMap] = useState(false)
+   977→
+   978→  useEffect(() => {
+   979→    if (typeof window !== 'undefined' && showMiniMap && !miniLeafletReady) {
+   980→      if (!document.querySelector('link[data-leaflet]')) {
+   981→        const link = document.createElement('link')
+   982→        link.rel = 'stylesheet'
+   983→        link.href = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css'
+   984→        link.setAttribute('data-leaflet', 'true')
+   985→        document.head.appendChild(link)
+   986→      }
+   987→      import('leaflet').then((L) => {
+   988→        delete (L.Icon.Default.prototype as any)._getIconUrl
+   989→        L.Icon.Default.mergeOptions({
+   990→          iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
+   991→          iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
+   992→          shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
+   993→        })
+   994→        setMiniLeafletReady(true)
+   995→      }).catch(() => {
+   996→        setTimeout(() => setShowMiniMap(false), 1000)
+   997→      })
+   998→    }
+   999→  }, [showMiniMap, miniLeafletReady])
+  1000→
+  1001→  const handleSeatClick = (seatNum: number) => {
+  1002→    const seat = seats.find(s => s.number === seatNum)
+  1003→    if (seat && !seat.isOccupied) {
+  1004→      setSelectedSeat(seatNum)
+  1005→    }
+  1006→  }
+  1007→
+  1008→  const handlePay = async () => {
+  1009→    if (!selectedSeat || !paymentMethod) return
+  1010→    if (!selectedStop && !usingCustom) return
+  1011→    if (paymentMethod === 'mpesa' && !mpesaPhone) {
+  1012→      toast.error('Please enter your M-Pesa phone number')
+  1013→      return
+  1014→    }
+  1015→
+  1016→    setProcessing(true)
+  1017→    try {
+  1018→      const stopOrder = usingCustom
+  1019→        ? (stops[stops.length - 1]?.order ?? 1)  // custom drop-off: treat as last stop
+  1020→        : (selectedStopData?.order || 1)
+  1021→      const res = await fetch('/api/passengers', {
+  1022→        method: 'POST',
+  1023→        headers: { 'Content-Type': 'application/json' },
+  1024→        body: JSON.stringify({
+  1025→          name: null,
+  1026→          phone: paymentMethod === 'mpesa' ? mpesaPhone : null,
+  1027→          seatNumber: selectedSeat,
+  1028→          boardingStop: stops[currentStopIndex]?.name || 'Unknown',
+  1029→          alightingStop: usingCustom ? customStop.trim() : selectedStop,
+  1030→          alightingStopOrder: stopOrder,
+  1031→          isCustomAlighting: usingCustom,
+  1032→          fare,
+  1033→          paymentMethod,
+  1034→          busId: busData?.id,
+  1035→        }),
+  1036→      })
+  1037→      const data = await res.json()
+  1038→
+  1039→      if (!res.ok) {
+  1040→        toast.error(data.error || 'Failed to board')
+  1041→        setProcessing(false)
+  1042→        return
+  1043→      }
+  1044→
+  1045→      // Emit WS event
+  1046→      if (busData?.id) {
+  1047→        emitSocket('passenger_boarded', {
+  1048→          busId: busData.id,
+  1049→          passenger: {
+  1050→            id: data.passenger?.id || 'new',
+  1051→            name: null,
+  1052→            phone: paymentMethod === 'mpesa' ? mpesaPhone : null,
+  1053→            seatNumber: selectedSeat,
+  1054→            boardingStop: stops[currentStopIndex]?.name || 'Unknown',
+  1055→            alightingStop: usingCustom ? customStop.trim() : selectedStop,
+  1056→            alightingStopOrder: stopOrder,
+  1057→            isCustomAlighting: usingCustom,
+  1058→            fare,
+  1059→            paymentStatus: 'paid',
+  1060→            paymentMethod,
+  1061→            boardedAt: new Date().toISOString(),
+  1062→          },
+  1063→        })
+  1064→      }
+  1065→
+  1066→      setProcessing(false)
+  1067→      setConfirmed(true)
+  1068→      toast.success('Payment confirmed! 🎉', { description: `Seat ${selectedSeat} booked` })
+  1069→      onRefresh()
+  1070→
+  1071→      setTimeout(() => {
+  1072→        setConfirmed(false)
+  1073→        setStep(1)
+  1074→        setSelectedSeat(null)
+  1075→        setSelectedStop('')
+  1076→        setCustomStop('')
+  1077→        setPaymentMethod('')
+  1078→        setMpesaPhone('')
+  1079→      }, 3000)
+  1080→    } catch {
+  1081→      toast.error('Payment failed')
+  1082→      setProcessing(false)
+  1083→    }
+  1084→  }
+  1085→
+  1086→  if (confirmed) {
+  1087→    return (
+  1088→      <motion.div
+  1089→        initial={{ scale: 0.8, opacity: 0 }}
+  1090→        animate={{ scale: 1, opacity: 1 }}
+  1091→        className="flex flex-col items-center justify-center py-16"
+  1092→      >
+  1093→        <motion.div
+  1094→          animate={{ scale: [1, 1.2, 1] }}
+  1095→          transition={{ duration: 0.5, repeat: 2 }}
+  1096→          className="w-20 h-20 rounded-full bg-blue-100 flex items-center justify-center mb-6"
+  1097→        >
+  1098→          <CheckCircle2 className="w-10 h-10 text-blue-600" />
+  1099→        </motion.div>
+  1100→        <h2 className="text-2xl font-bold text-blue-800 mb-2">You&apos;re all set! 🎉</h2>
+  1101→        <p className="text-gray-600">Seat {selectedSeat} • {customStop || selectedStop}</p>
+  1102→        <p className="text-blue-600 font-semibold mt-1">KES {fare}</p>
+  1103→      </motion.div>
+  1104→    )
+  1105→  }
+  1106→
+  1107→  // Compute ETA to passenger's selected alighting stop
+  1108→  // Prefer real ETA from /api/gps intelligence; fall back to heuristic
+  1109→  const etaMinutes = (() => {
+  1110→    if (!selectedStopData) return null
+  1111→    // Real ETA from server (Haversine + actual speed)
+  1112→    if (gpsData?.etas) {
+  1113→      const match = gpsData.etas.find(e => e.order === selectedStopData.order)
+  1114→      if (match && match.etaMinutes !== null) return match.etaMinutes
+  1115→    }
+  1116→    // Fallback: heuristic
+  1117→    if (!gpsData?.speed || gpsData.speed < 5) return null
+  1118→    const stopsToGo = selectedStopData.order - (currentStopIndex + 1)
+  1119→    if (stopsToGo <= 0) return 0
+  1120→    return Math.max(1, Math.round(stopsToGo * 3 - (stopsToGo * 3 * 0.2)))
+  1121→  })()
+  1122→
+  1123→  return (
+  1124→    <div className="space-y-6">
+  1125→      {/* Header */}
+  1126→      <div className="text-center">
+  1127→        <h2 className="text-2xl font-bold text-blue-800">Welcome aboard! 🚌</h2>
+  1128→        <p className="text-gray-500 mt-1">Select your seat and destination</p>
+  1129→      </div>
+  1130→
+  1131→      {/* Off-route alert banner */}
+  1132→      {gpsData?.isOffRoute && (
+  1133→        <motion.div
+  1134→          initial={{ opacity: 0, y: -10 }}
+  1135→          animate={{ opacity: 1, y: 0 }}
+  1136→          className="bg-red-50 border-2 border-red-300 rounded-lg p-3 flex items-center gap-3"
+  1137→        >
+  1138→          <div className="w-8 h-8 rounded-full bg-red-100 flex items-center justify-center shrink-0">
+  1139→            <Navigation className="w-4 h-4 text-red-600" />
+  1140→          </div>
+  1141→          <div className="flex-1">
+  1142→            <p className="text-sm font-semibold text-red-700">
+  1143→              Bus is currently off-route
+  1144→            </p>
+  1145→            <p className="text-xs text-red-500">
+  1146→              {gpsData.offRouteDistance || 0}m from scheduled route — your trip may take longer than expected
+  1147→            </p>
+  1148→          </div>
+  1149→        </motion.div>
+  1150→      )}
+  1151→
+  1152→      {/* Mini Live Bus Tracker */}
+  1153→      <Card className="border-blue-200 bg-gradient-to-br from-blue-50 to-teal-50">
+  1154→        <CardHeader className="pb-2">
+  1155→          <div className="flex items-center justify-between">
+  1156→            <CardTitle className="text-base flex items-center gap-2 text-blue-800">
+  1157→              <Navigation className="w-4 h-4 text-blue-600" />
+  1158→              Live Bus Tracker
+  1159→            </CardTitle>
+  1160→            <button
+  1161→              onClick={() => setShowMiniMap(s => !s)}
+  1162→              className="text-xs text-blue-600 hover:text-blue-800 underline"
+  1163→            >
+  1164→              {showMiniMap ? 'Hide map' : 'Show map'}
+  1165→            </button>
+  1166→          </div>
+  1167→        </CardHeader>
+  1168→        <CardContent className="space-y-3">
+  1169→          {/* GPS status row */}
+  1170→          <div className="flex items-center gap-3 flex-wrap text-xs">
+  1171→            <span className="flex items-center gap-1.5 px-2 py-1 rounded-full bg-white border border-blue-200">
+  1172→              <span className={`w-2 h-2 rounded-full ${gpsData?.speed ? 'bg-blue-500 animate-pulse' : 'bg-gray-300'}`} />
+  1173→              {gpsData?.speed ? 'Live' : 'Waiting'}
+  1174→            </span>
+  1175→            {gpsData?.speed !== undefined && (
+  1176→              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-blue-200">
+  1177→                <span className="text-blue-600 font-bold">{gpsData.speed}</span>
+  1178→                <span className="text-gray-500">km/h</span>
+  1179→              </span>
+  1180→            )}
+  1181→            {gpsData?.routeProgressPercent !== undefined && (
+  1182→              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-blue-100 border border-blue-300 text-blue-700 font-medium">
+  1183→                {gpsData.routeProgressPercent}% route
+  1184→              </span>
+  1185→            )}
+  1186→            {gpsData?.atStopName && (
+  1187→              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-blue-100 border border-blue-300 text-blue-700 font-medium">
+  1188→                📍 At {gpsData.atStopName}
+  1189→              </span>
+  1190→            )}
+  1191→            {gpsData?.currentLocation && (
+  1192→              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-blue-200 text-gray-500">
+  1193→                {gpsData.currentLocation.lat.toFixed(4)}, {gpsData.currentLocation.lng.toFixed(4)}
+  1194→              </span>
+  1195→            )}
+  1196→            {etaMinutes !== null && (
+  1197→              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-amber-100 border border-amber-300 text-amber-700 font-medium">
+  1198→                ETA: ~{etaMinutes} min to {selectedStopData?.name?.split(' ')[0] || 'stop'}
+  1199→              </span>
+  1200→            )}
+  1201→          </div>
+  1202→
+  1203→          {/* Mini map */}
+  1204→          {showMiniMap && typeof window !== 'undefined' && miniLeafletReady && (
+  1205→            <div style={{ height: '180px', borderRadius: '8px', overflow: 'hidden', border: '1px solid #d1d5db' }}>
+  1206→              <MapContainer
+  1207→                center={gpsData?.currentLocation ? [gpsData.currentLocation.lat, gpsData.currentLocation.lng] : [-4.05, 39.67]}
+  1208→                zoom={13}
+  1209→                style={{ height: '100%', width: '100%' }}
+  1210→                scrollWheelZoom={false}
+  1211→                zoomControl={false}
+  1212→              >
+  1213→                <MapRecenter position={gpsData?.currentLocation ? [gpsData.currentLocation.lat, gpsData.currentLocation.lng] : null} />
+  1214→                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+  1215→                <Polyline positions={gpsData?.routeLine?.map(p => [p.lat, p.lng]) || []} color="#059669" weight={3} opacity={0.6} />
+  1216→                {gpsData?.routeStops?.slice(currentStopIndex, currentStopIndex + 3).map(stop => (
+  1217→                  <Marker key={stop.order} position={[stop.lat, stop.lng]}>
+  1218→                    <Popup>{stop.stopName}</Popup>
+  1219→                  </Marker>
+  1220→                ))}
+  1221→                {gpsData?.currentLocation && (
+  1222→                  <Marker position={[gpsData.currentLocation.lat, gpsData.currentLocation.lng]}>
+  1223→                    <Popup>🚌 Your bus — {gpsData.speed} km/h</Popup>
+  1224→                  </Marker>
+  1225→                )}
+  1226→              </MapContainer>
+  1227→            </div>
+  1228→          )}
+  1229→
+  1230→          {/* Next stop callout */}
+  1231→          <div className="flex items-center gap-2 text-xs text-blue-700 bg-white/60 rounded-lg p-2">
+  1232→            <MapPin className="w-3.5 h-3.5 shrink-0" />
+  1233→            <span>
+  1234→              {gpsData?.currentLocation ? 'Now approaching ' : 'Currently at '}
+  1235→              <strong>{stops[currentStopIndex]?.name || 'Unknown'}</strong>
+  1236→              {stops[currentStopIndex + 1] && (
+  1237→                <> • Next: <strong>{stops[currentStopIndex + 1].name}</strong></>
+  1238→              )}
+  1239→            </span>
+  1240→          </div>
+  1241→
+  1242→          {/* Last updated */}
+  1243→          {gpsData?.lastUpdated && (
+  1244→            <p className="text-[10px] text-gray-400 text-right">
+  1245→              Updated {new Date(gpsData.lastUpdated).toLocaleTimeString()}
+  1246→            </p>
+  1247→          )}
+  1248→        </CardContent>
+  1249→      </Card>
+  1250→
+  1251→      {/* Route Progress Tracker */}
+  1252→      <Card className="bg-gradient-to-r from-blue-50 to-teal-50 border-blue-200">
+  1253→        <CardContent className="p-4">
+  1254→          <div className="flex items-center gap-2 mb-2">
+  1255→            <Navigation className="w-4 h-4 text-blue-600" />
+  1256→            <span className="text-sm font-semibold text-blue-800">Route Progress</span>
+  1257→          </div>
+  1258→          <div className="relative flex items-center justify-between gap-1">
+  1259→            {/* Connecting line */}
+  1260→            <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-gray-200 -translate-y-1/2" />
+  1261→            <div
+  1262→              className="absolute top-1/2 left-0 h-0.5 bg-blue-500 -translate-y-1/2 transition-all duration-500"
+  1263→              style={{ width: `${stops.length > 1 ? (currentStopIndex / (stops.length - 1)) * 100 : 0}%` }}
+  1264→            />
+  1265→            {/* Stop dots */}
+  1266→            {stops.map((stop, i) => (
+  1267→              <div key={stop.id} className="relative flex flex-col items-center z-10">
+  1268→                <div
+  1269→                  className={`w-4 h-4 rounded-full border-2 transition-all duration-300 ${
+  1270→                    i < currentStopIndex
+  1271→                      ? 'bg-blue-500 border-blue-500'
+  1272→                      : i === currentStopIndex
+  1273→                      ? 'bg-blue-500 border-blue-600 ring-2 ring-yellow-300 scale-125'
+  1274→                      : 'bg-white border-gray-300'
+  1275→                  }`}
+  1276→                >
+  1277→                  {i === currentStopIndex && (
+  1278→                    <span className="absolute -top-5 left-1/2 -translate-x-1/2 text-xs">🚌</span>
+  1279→                  )}
+  1280→                </div>
+  1281→                <span
+  1282→                  className={`text-[9px] mt-1 max-w-[40px] text-center leading-tight truncate ${
+  1283→                    i === currentStopIndex ? 'font-bold text-blue-700' : 'text-gray-400'
+  1284→                  }`}
+  1285→                >
+  1286→                  {stop.name.split(' ')[0]}
+  1287→                </span>
+  1288→              </div>
+  1289→            ))}
+  1290→          </div>
+  1291→          <div className="flex items-center justify-center gap-2 mt-3">
+  1292→            <span className="text-xs text-gray-500">Current:</span>
+  1293→            <Badge variant="default" className="bg-blue-600 text-xs">
+  1294→              {stops[currentStopIndex]?.name || 'Unknown'}
+  1295→            </Badge>
+  1296→            {gpsData && gpsData.speed > 0 && (
+  1297→              <span className="text-xs text-blue-600 font-medium">
+  1298→                • {gpsData.speed} km/h
+  1299→              </span>
+  1300→            )}
+  1301→          </div>
+  1302→        </CardContent>
+  1303→      </Card>
+  1304→
+  1305→      {/* Step indicators */}
+  1306→      <div className="flex items-center justify-center gap-2">
+  1307→        {[1, 2, 3].map(s => (
+  1308→          <React.Fragment key={s}>
+  1309→            <button
+  1310→              onClick={() => s < step && setStep(s)}
+  1311→              className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-all ${
+  1312→                step === s ? 'bg-blue-600 text-white scale-110' :
+  1313→                s < step ? 'bg-blue-200 text-blue-700' :
+  1314→                'bg-gray-100 text-gray-400'
+  1315→              }`}
+  1316→            >
+  1317→              {s < step ? <CheckCircle2 className="w-4 h-4" /> : s}
+  1318→            </button>
+  1319→            {s < 3 && <div className={`w-12 h-0.5 ${s < step ? 'bg-blue-400' : 'bg-gray-200'}`} />}
+  1320→          </React.Fragment>
+  1321→        ))}
+  1322→      </div>
+  1323→
+  1324→      {/* Step 1: Seat Map */}
+  1325→      {step === 1 && (
+  1326→        <Card>
+  1327→          <CardHeader className="pb-3">
+  1328→            <CardTitle className="text-lg flex items-center gap-2">
+  1329→              <Armchair className="w-5 h-5 text-blue-600" />
+  1330→              Pick Your Seat
+  1331→            </CardTitle>
+  1332→            <CardDescription>
+  1333→              <span className="flex items-center gap-3 text-xs mt-1">
+  1334→                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-100 border border-blue-400" /> Available</span>
+  1335→                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-100 border border-red-400" /> Occupied</span>
+  1336→                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-400 border border-blue-600" /> Selected</span>
+  1337→              </span>
+  1338→            </CardDescription>
+  1339→          </CardHeader>
+  1340→          <CardContent>
+  1341→            <div className="max-w-xs mx-auto grid grid-cols-4 gap-2">
+  1342→              {/* Row labels: 2 seats | aisle | 2 seats pattern for 14-seat matatu */}
+  1343→              {Array.from({ length: 14 }, (_, i) => {
+  1344→                const seatNum = i + 1
+  1345→                const seat = seats.find(s => s.number === seatNum)
+  1346→                const isSelected = selectedSeat === seatNum
+  1347→                const isOccupied = seat?.isOccupied
+  1348→
+  1349→                // Layout: seats 1-2 per row, aisle break every 2 seats
+  1350→                const row = Math.floor(i / 2)
+  1351→                const isRightSide = i % 2 === 1
+  1352→
+  1353→                return (
+  1354→                  <React.Fragment key={seatNum}>
+  1355→                    <button
+  1356→                      disabled={isOccupied}
+  1357→                      onClick={() => handleSeatClick(seatNum)}
+  1358→                      className={`p-2 rounded-lg border-2 text-center transition-all text-sm font-medium ${
+  1359→                        isSelected ? SEAT_COLORS.selected :
+  1360→                        isOccupied ? getSeatColor(seat!, currentStopIndex) + ' cursor-not-allowed opacity-70' :
+  1361→                        SEAT_COLORS.available
+  1362→                      }`}
+  1363→                    >
+  1364→                      <Armchair className="w-4 h-4 mx-auto mb-0.5" />
+  1365→                      <span className="text-xs">{seatNum}</span>
+  1366→                    </button>
+  1367→                    {isRightSide && row < 6 && (
+  1368→                      <div className="col-span-4 h-1" />
+  1369→                    )}
+  1370→                  </React.Fragment>
+  1371→                )
+  1372→              })}
+  1373→            </div>
+  1374→            {selectedSeat && (
+  1375→              <motion.div
+  1376→                initial={{ opacity: 0, y: 10 }}
+  1377→                animate={{ opacity: 1, y: 0 }}
+  1378→                className="mt-4 text-center"
+  1379→              >
+  1380→                <Button
+  1381→                  onClick={() => setStep(2)}
+  1382→                  className="bg-blue-600 hover:bg-blue-700"
+  1383→                >
+  1384→                  Continue with Seat {selectedSeat} <ChevronRight className="w-4 h-4 ml-1" />
+  1385→                </Button>
+  1386→              </motion.div>
+  1387→            )}
+  1388→          </CardContent>
+  1389→        </Card>
+  1390→      )}
+  1391→
+  1392→      {/* Step 2: Select Alighting Stop */}
+  1393→      {step === 2 && (
+  1394→        <Card>
+  1395→          <CardHeader className="pb-3">
+  1396→            <CardTitle className="text-lg flex items-center gap-2">
+  1397→              <MapPin className="w-5 h-5 text-blue-700" />
+  1398→              Select Your Stop
+  1399→            </CardTitle>
+  1400→            <CardDescription>
+  1401→              Where are you getting off? Fares are auto-calculated from the SACCO&apos;s fare matrix.
+  1402→            </CardDescription>
+  1403→          </CardHeader>
+  1404→          <CardContent className="space-y-3">
+  1405→            <div className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar pr-1">
+  1406→              {stops.filter(s => s.order > currentStopIndex).map(stop => {
+  1407→                const segmentFare = computeFare(stops, currentStopIndex, stop.name, false)
+  1408→                return (
+  1409→                  <button
+  1410→                    key={stop.id}
+  1411→                    onClick={() => { setSelectedStop(stop.name); setCustomStop('') }}
+  1412→                    className={`w-full flex items-center gap-3 p-3 rounded-lg border-2 transition-all text-left ${
+  1413→                      selectedStop === stop.name
+  1414→                        ? 'border-blue-600 bg-blue-50'
+  1415→                        : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50/30'
+  1416→                    }`}
+  1417→                  >
+  1418→                    <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-700 font-bold text-xs shrink-0">
+  1419→                      {stop.order}
+  1420→                    </div>
+  1421→                    <div className="flex-1 min-w-0">
+  1422→                      <p className="font-medium text-sm truncate">{stop.name}</p>
+  1423→                      <div className="flex items-center gap-2 mt-0.5">
+  1424→                        <Badge variant="outline" className="text-xs">
+  1425→                          {stop.isStage ? 'Stage' : 'Custom'}
+  1426→                        </Badge>
+  1427→                        {typeof stop.fareFromOrigin === 'number' && (
+  1428→                          <span className="text-[10px] text-gray-400">
+  1429→                            fare from origin: KES {stop.fareFromOrigin}
+  1430→                          </span>
+  1431→                        )}
+  1432→                      </div>
+  1433→                    </div>
+  1434→                    <span className="text-sm font-semibold text-blue-700 shrink-0">
+  1435→                      KES {segmentFare}
+  1436→                    </span>
+  1437→                    {selectedStop === stop.name && (
+  1438→                      <CheckCircle2 className="w-5 h-5 text-blue-700 shrink-0" />
+  1439→                    )}
+  1440→                  </button>
+  1441→                )
+  1442→              })}
+  1443→            </div>
+  1444→
+  1445→            <Separator />
+  1446→
+  1447→            <div className="bg-yellow-50 border border-yellow-300 rounded-lg p-3">
+  1448→              <p className="text-sm font-medium text-yellow-900 mb-2 flex items-center gap-1.5">
+  1449→                <MapPin className="w-4 h-4 text-yellow-700" />
+  1450→                Or enter a custom drop-off landmark
+  1451→              </p>
+  1452→              <p className="text-[11px] text-yellow-800 mb-2 leading-relaxed">
+  1453→                For places the driver knows but that aren&apos;t on the registered route —
+  1454→                e.g. <em>&quot;near Naivas Supermarket&quot;</em> or <em>&quot;after the blue mosque&quot;</em>.
+  1455→                The driver and conductor will see this flagged on their seat map.
+  1456→              </p>
+  1457→              <Input
+  1458→                placeholder="e.g., Near Naivas Supermarket"
+  1459→                value={customStop}
+  1460→                onChange={e => { setCustomStop(e.target.value); setSelectedStop('') }}
+  1461→                className="text-sm border-yellow-400 focus-visible:ring-yellow-500"
+  1462→              />
+  1463→              {usingCustom && (
+  1464→                <p className="text-xs text-yellow-800 mt-2">
+  1465→                  Custom drop-off fare: <strong>KES {fare}</strong> (charged to the end of the route — conductor can adjust).
+  1466→                </p>
+  1467→              )}
+  1468→            </div>
+  1469→
+  1470→            <div className="flex gap-2 pt-2">
+  1471→              <Button variant="outline" onClick={() => setStep(1)}>Back</Button>
+  1472→              <Button
+  1473→                onClick={() => setStep(3)}
+  1474→                disabled={!selectedStop && !customStop}
+  1475→                className="bg-blue-700 hover:bg-blue-800 flex-1"
+  1476→              >
+  1477→                Continue <ChevronRight className="w-4 h-4 ml-1" />
+  1478→              </Button>
+  1479→            </div>
+  1480→          </CardContent>
+  1481→        </Card>
+  1482→      )}
+  1483→
+  1484→      {/* Step 3: Payment */}
+  1485→      {step === 3 && (
+  1486→        <Card>
+  1487→          <CardHeader className="pb-3">
+  1488→            <CardTitle className="text-lg flex items-center gap-2">
+  1489→              <CreditCard className="w-5 h-5 text-blue-600" />
+  1490→              Payment
+  1491→            </CardTitle>
+  1492→            <CardDescription>Choose your payment method</CardDescription>
+  1493→          </CardHeader>
+  1494→          <CardContent className="space-y-4">
+  1495→            <div className="bg-blue-50 rounded-lg p-4 text-center">
+  1496→              <p className="text-sm text-blue-600">Total Fare</p>
+  1497→              <p className="text-3xl font-bold text-blue-800">KES {fare}</p>
+  1498→              <p className="text-xs text-blue-500 mt-1">
+  1499→                Seat {selectedSeat} → {customStop || selectedStop}
+  1500→              </p>
+  1501→            </div>
+  1502→
+  1503→            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+  1504→              {[
+  1505→                { key: 'mpesa', label: 'M-Pesa', icon: <Phone className="w-5 h-5" />, color: 'text-green-600' },
+  1506→                { key: 'nfc', label: 'NFC', icon: <Nfc className="w-5 h-5" />, color: 'text-orange-500' },
+  1507→                { key: 'qr', label: 'QR Code', icon: <QrCode className="w-5 h-5" />, color: 'text-purple-600' },
+  1508→                { key: 'cash', label: 'Cash', icon: <Banknote className="w-5 h-5" />, color: 'text-yellow-600' },
+  1509→                { key: 'card', label: 'Card', icon: <CreditCard className="w-5 h-5" />, color: 'text-cyan-600' },
+  1510→              ].map(method => (
+  1511→                <button
+  1512→                  key={method.key}
+  1513→                  onClick={() => setPaymentMethod(method.key)}
+  1514→                  className={`flex flex-col items-center gap-1 p-3 rounded-lg border-2 transition-all ${
+  1515→                    paymentMethod === method.key
+  1516→                      ? 'border-blue-500 bg-blue-50'
+  1517→                      : 'border-gray-200 hover:border-blue-300'
+  1518→                  }`}
+  1519→                >
+  1520→                  <span className={method.color}>{method.icon}</span>
+  1521→                  <span className="text-xs font-medium">{method.label}</span>
+  1522→                </button>
+  1523→              ))}
+  1524→            </div>
+  1525→
+  1526→            {paymentMethod === 'mpesa' && (
+  1527→              <motion.div
+  1528→                initial={{ opacity: 0, height: 0 }}
+  1529→                animate={{ opacity: 1, height: 'auto' }}
+  1530→                className="space-y-2"
+  1531→              >
+  1532→                <label className="text-sm font-medium text-gray-700">M-Pesa Phone Number</label>
+  1533→                <Input
+  1534→                  placeholder="+254 7XX XXX XXX"
+  1535→                  value={mpesaPhone}
+  1536→                  onChange={e => setMpesaPhone(e.target.value)}
+  1537→                  className="text-sm"
+  1538→                />
+  1539→              </motion.div>
+  1540→            )}
+  1541→
+  1542→            <div className="flex gap-2 pt-2">
+  1543→              <Button variant="outline" onClick={() => setStep(2)}>Back</Button>
+  1544→              <Button
+  1545→                onClick={handlePay}
+  1546→                disabled={!paymentMethod || processing || (paymentMethod === 'mpesa' && !mpesaPhone)}
+  1547→                className="bg-blue-600 hover:bg-blue-700 flex-1"
+  1548→              >
+  1549→                {processing ? (
+  1550→                  <span className="flex items-center gap-2">
+  1551→                    <motion.div
+  1552→                      animate={{ rotate: 360 }}
+  1553→                      transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
+  1554→                    >
+  1555→                      <CreditCard className="w-4 h-4" />
+  1556→                    </motion.div>
+  1557→                    Processing...
+  1558→                  </span>
+  1559→                ) : (
+  1560→                  <span>Pay KES {fare}</span>
+  1561→                )}
+  1562→              </Button>
+  1563→            </div>
+  1564→          </CardContent>
+  1565→        </Card>
+  1566→      )}
+  1567→
+  1568→      {/* Summary card */}
+  1569→      {selectedSeat && (
+  1570→        <Card className="bg-gradient-to-r from-blue-50 to-teal-50 border-blue-200">
+  1571→          <CardContent className="p-4">
+  1572→            <h4 className="font-semibold text-blue-800 text-sm mb-2">Your Trip Summary</h4>
+  1573→            <div className="grid grid-cols-2 gap-2 text-sm">
+  1574→              <div className="flex items-center gap-2">
+  1575→                <Armchair className="w-4 h-4 text-blue-600" />
+  1576→                <span className="text-gray-600">Seat:</span>
+  1577→                <span className="font-medium">{selectedSeat}</span>
+  1578→              </div>
+  1579→              <div className="flex items-center gap-2">
+  1580→                <MapPin className="w-4 h-4 text-blue-600" />
+  1581→                <span className="text-gray-600">To:</span>
+  1582→                <span className="font-medium truncate">{customStop || selectedStop || '—'}</span>
+  1583→              </div>
+  1584→              <div className="flex items-center gap-2">
+  1585→                <DollarSign className="w-4 h-4 text-blue-600" />
+  1586→                <span className="text-gray-600">Fare:</span>
+  1587→                <span className="font-medium">KES {fare}</span>
+  1588→              </div>
+  1589→              <div className="flex items-center gap-2">
+  1590→                <CreditCard className="w-4 h-4 text-blue-600" />
+  1591→                <span className="text-gray-600">Payment:</span>
+  1592→                <span className="font-medium capitalize">{paymentMethod || '—'}</span>
+  1593→              </div>
+  1594→            </div>
+  1595→          </CardContent>
+  1596→        </Card>
+  1597→      )}
+  1598→    </div>
+  1599→  )
+  1600→}
+  1601→
+  1602→// ═══════════════════════════════════════════════════════════════════
+  1603→// CONDUCTOR PANEL
+  1604→// ═══════════════════════════════════════════════════════════════════
+  1605→function ConductorPanel({
+  1606→  busData,
+  1607→  tripData,
+  1608→  stops,
+  1609→  seats,
+  1610→  currentStopIndex,
+  1611→  emitSocket,
+  1612→  notifications,
+  1613→  onRefresh,
+  1614→}: {
+  1615→  busData: BusData | null
+  1616→  tripData: TripData | null
+  1617→  stops: Stop[]
+  1618→  seats: Seat[]
+  1619→  currentStopIndex: number
+
+[showing lines 940-1619 of 4029; use offset=1620 with limit to continue reading]
