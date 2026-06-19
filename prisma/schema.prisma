@@ -107,6 +107,10 @@ model Passenger {
   boardingStop   String
   alightingStop  String
   alightingStopOrder Int @default(0)
+  // isCustomAlighting=true means the passenger typed a free-text drop-off
+  // (a stage the driver knows but isn't on the registered route). Crew must
+  // remember to drop them at the named landmark.
+  isCustomAlighting Boolean @default(false)
   fare           Float    @default(0)
   paymentStatus  String   @default("unpaid") // unpaid, pending, paid
   paymentMethod  String?  // mpesa, nfc, qr, cash, card
@@ -158,18 +162,20 @@ model NotificationLog {
   createdAt DateTime @default(now())
 }
 
-// Owner is the auth principal in multi-SACCO mode.
-// For demo we look up the first Owner, in production this would be
-// tied to a session/JWT carrying ownerId.
+// Owner is the auth principal in multi-SACCO mode. Authentication is
+// handled by NextAuth (Credentials provider) — the owner signs in with
+// their email + password; the session exposes `ownerId` and `saccoId`
+// which the API routes use to scope all queries.
 model Owner {
-  id        String   @id @default(cuid())
-  name      String
-  phone     String
-  email     String?
-  saccoId   String   @unique
-  sacco     SACCO    @relation(fields: [saccoId], references: [id])
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           String   @id @default(cuid())
+  name         String
+  phone        String
+  email        String   @unique
+  passwordHash String?  // bcrypt hash; null only for legacy seed rows
+  saccoId      String   @unique
+  sacco        SACCO    @relation(fields: [saccoId], references: [id])
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 model GPSHistory {

@@ -24,7 +24,11 @@ export async function POST(request: Request) {
     const data = await request.json();
 
     // Board a new passenger
-    const { name, phone, seatNumber, boardingStop, alightingStop, alightingStopOrder, fare, paymentMethod, busId } = data;
+    const {
+      name, phone, seatNumber,
+      boardingStop, alightingStop, alightingStopOrder,
+      isCustomAlighting, fare, paymentMethod, busId,
+    } = data;
 
     const bus = await db.bus.findFirst({ where: { id: busId } });
     if (!bus) return NextResponse.json({ error: "Bus not found" }, { status: 404 });
@@ -49,6 +53,7 @@ export async function POST(request: Request) {
         boardingStop,
         alightingStop,
         alightingStopOrder,
+        isCustomAlighting: Boolean(isCustomAlighting),
         fare,
         paymentStatus: paymentMethod ? "paid" : "unpaid",
         paymentMethod: paymentMethod || null,

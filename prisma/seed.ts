@@ -1,4 +1,5 @@
 import { db } from "@/lib/db";
+import bcrypt from "bcryptjs";
 
 // ─── 33-seater Coaster layout ────────────────────────────────────────
 // 4 rows of 2+2 = 16 in front body, plus 4 rows of 3-across = 17 in back
@@ -105,7 +106,7 @@ async function createSaccoWithRoutes(opts: {
   saccoName: string;
   region: string;
   code: string;
-  owner: { name: string; phone: string; email: string };
+  owner: { name: string; phone: string; email: string; password: string };
   routes: RouteDef[];
   buses: Array<{
     name: string;
@@ -118,8 +119,15 @@ async function createSaccoWithRoutes(opts: {
     data: { name: opts.saccoName, region: opts.region, code: opts.code },
   });
 
+  const passwordHash = await bcrypt.hash(opts.owner.password, 10);
   await db.owner.create({
-    data: { ...opts.owner, saccoId: sacco.id },
+    data: {
+      name: opts.owner.name,
+      phone: opts.owner.phone,
+      email: opts.owner.email.toLowerCase(),
+      passwordHash,
+      saccoId: sacco.id,
+    },
   });
 
   // Create routes + stops
@@ -206,7 +214,12 @@ async function main() {
     saccoName: "Likoni Express SACCO",
     region: "Mombasa",
     code: "LKN-EXP",
-    owner: { name: "John Mwangi", phone: "+254712345678", email: "mwangi@matatulink.co.ke" },
+    owner: {
+      name: "John Mwangi",
+      phone: "+254712345678",
+      email: "mwangi@matatulink.co.ke",
+      password: "matatu123",
+    },
     routes: [LIKONI_MOMBASA],
     buses: [
       { name: "MatatuLink Demo Bus", reg: "KBA 234J", layoutType: "matatu_14", routeIndex: 0 },
@@ -219,7 +232,12 @@ async function main() {
     saccoName: "CitiHopa SACCO",
     region: "Nairobi",
     code: "CITIHOPA",
-    owner: { name: "Grace Wanjiru", phone: "+254722999000", email: "grace@citihopa.co.ke" },
+    owner: {
+      name: "Grace Wanjiru",
+      phone: "+254722999000",
+      email: "grace@citihopa.co.ke",
+      password: "nairobi123",
+    },
     routes: [NAIROBI_33, NAIROBI_110],
     buses: [
       { name: "Umoja Cruiser", reg: "KDK 881X", layoutType: "matatu_14", routeIndex: 0 },
@@ -290,7 +308,9 @@ async function main() {
 
   console.log("✅ Seed complete — multi-SACCO");
   console.log(`  SACCO 1: ${s1.name} (${s1.code}) — Mombasa, 2 buses (14 + 33 seater)`);
+  console.log(`    login: mwangi@matatulink.co.ke / matatu123`);
   console.log(`  SACCO 2: ${s2.name} (${s2.code}) — Nairobi, 2 buses, 2 routes (33, 110)`);
+  console.log(`    login: grace@citihopa.co.ke / nairobi123`);
 }
 
 main()

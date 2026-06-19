@@ -5,6 +5,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { io, Socket } from 'socket.io-client'
 import { toast } from 'sonner'
+import { signIn, signOut, useSession } from 'next-auth/react'
 import {
   Bus, Users, UserCheck, Car, BarChart3,
   Armchair, MapPin, CreditCard, CheckCircle2,
@@ -14,6 +15,7 @@ import {
   TrendingUp, PieChart as PieChartIcon, Activity,
   User, ArrowRight, Radio, Bell as BellIcon,
   Plus, Route as RouteIcon, Trash2, Building2,
+  LogIn, LogOut, Mail, Lock, Upload, FileSpreadsheet,
 } from 'lucide-react'
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -51,6 +53,9 @@ interface Passenger {
   boardingStop: string
   alightingStop: string
   alightingStopOrder: number
+  // true = passenger typed a free-text landmark the driver knows but
+  // isn't on the registered route (e.g. "near Naivas")
+  isCustomAlighting?: boolean
   fare: number
   paymentStatus: string
   paymentMethod: string | null
@@ -140,6 +145,9 @@ interface GPSData {
 }
 
 // ─── Color helpers ────────────────────────────────────────────────
+// MatatuLink brand palette: BLUE (primary) + YELLOW (accent).
+// State indicators (red/orange) are kept semantic — they communicate
+// seat status, not brand identity.
 const PAYMENT_COLORS: Record<string, string> = {
   mpesa: '#16a34a',
   cash: '#eab308',
@@ -149,11 +157,11 @@ const PAYMENT_COLORS: Record<string, string> = {
 }
 
 const SEAT_COLORS = {
-  available: 'bg-emerald-100 border-emerald-400 hover:bg-emerald-200 cursor-pointer',
+  available: 'bg-blue-50 border-blue-300 hover:bg-blue-100 cursor-pointer text-blue-700',
   occupied: 'bg-red-100 border-red-400',
   occupiedFar: 'bg-orange-100 border-orange-400',
   unpaid: 'bg-yellow-100 border-yellow-500 border-dashed',
-  selected: 'bg-emerald-400 border-emerald-600 text-white',
+  selected: 'bg-yellow-400 border-yellow-600 text-yellow-950 ring-2 ring-yellow-300',
 }
 
 function getSeatColor(seat: Seat, currentStopIndex: number): string {
@@ -165,10 +173,47 @@ function getSeatColor(seat: Seat, currentStopIndex: number): string {
   return SEAT_COLORS.occupiedFar
 }
 
+/**
+ * Fare matrix calculator.
+ *
+ * Each registered Stop carries a `fareFromOrigin` (the cumulative fare
+ * from the route origin to that stop, set by the SACCO owner when they
+ * register the route). The fare for a boarding→alighting leg is the
+ * difference between the alighting stop's fareFromOrigin and the
+ * boarding stop's fareFromOrigin — i.e. the per-segment price.
+ *
+ * For custom (free-text) alighting points the driver knows but that
+ * aren't on the route, we fall back to the fare of the LAST registered
+ * stop (treating it as "to the end of the route") and let the
+ * conductor adjust if needed.
+ */
+function computeFare(
+  stops: Stop[],
+  boardingIndex: number,
+  alightingStopName: string | null,
+  isCustom: boolean,
+): number {
+  if (!stops.length) return 0
+  const boardingStop = stops[boardingIndex]
+  const boardingFare = boardingStop?.fareFromOrigin ?? 0
+
+  if (isCustom || !alightingStopName) {
+    // Custom drop-off: charge to the end of the route by default
+    const lastStop = stops[stops.length - 1]
+    const endFare = lastStop?.fareFromOrigin ?? 0
+    return Math.max(0, endFare - boardingFare)
+  }
+
+  const alight = stops.find(s => s.name === alightingStopName)
+  if (!alight) return 0
+  const alightFare = alight.fareFromOrigin ?? 0
+  return Math.max(0, alightFare - boardingFare)
+}
+
 // ─── Dynamic Leaflet Imports (SSR-safe) ──────────────────────────
 const MapContainer = dynamic(
   () => import('react-leaflet').then(mod => mod.MapContainer),
-  { ssr: false, loading: () => <div style={{ height: '300px', background: '#f0fdf4', borderRadius: '8px' }} className="flex items-center justify-center text-emerald-600 text-sm">Loading map...</div> }
+  { ssr: false, loading: () => <div style={{ height: '300px', background: '#f0fdf4', borderRadius: '8px' }} className="flex items-center justify-center text-blue-600 text-sm">Loading map...</div> }
 )
 const TileLayer = dynamic(
   () => import('react-leaflet').then(mod => mod.TileLayer),
@@ -205,6 +250,10 @@ function MapRecenter({ position }: { position: [number, number] | null }) {
 type TabType = 'passenger' | 'conductor' | 'driver' | 'owner'
 
 export default function Home() {
+  // NextAuth session — drives the SACCO context. When unauthenticated
+  // the user sees a sign-in card instead of the dashboard.
+  const { data: session, status } = useSession()
+
   const [activeTab, setActiveTab] = useState<TabType>('passenger')
   const [busData, setBusData] = useState<BusData | null>(null)
   const [tripData, setTripData] = useState<TripData | null>(null)
@@ -219,12 +268,18 @@ export default function Home() {
   const fetchFleetDataRef = useRef<(() => Promise<void>) | null>(null)
 
   // ─── Multi-SACCO state ──────────────────────────────────────────
-  // For demo, the user can switch between owners (in production this
-  // would be driven by login). Each owner belongs to exactly one SACCO
-  // and only ever sees their own SACCO's buses/routes.
-  const [ownerId, setOwnerId] = useState<string | null>(null)
-  const [ownerList, setOwnerList] = useState<Array<{ id: string; name: string; saccoName: string; region: string }>>([])
+  // After NextAuth login the ownerId comes from the session JWT. We
+  // still keep the ownerId in local state so existing fetch helpers
+  // don't need to be rewritten.
+  const sessionOwnerId = (session as any)?.ownerId as string | undefined
+  const [ownerId, setOwnerId] = useState<string | null>(sessionOwnerId ?? null)
+  const [ownerList, setOwnerList] = useState<Array<{ email: string; name: string; saccoName: string; region: string }>>([])
   const [ownerMeta, setOwnerMeta] = useState<{ saccoName: string; region: string } | null>(null)
+
+  // ─── Sign-in form state ─────────────────────────────────────────
+  const [signInEmail, setSignInEmail] = useState('')
+  const [signInPassword, setSignInPassword] = useState('')
+  const [signInLoading, setSignInLoading] = useState(false)
 
   // ─── Active bus selector (Conductor/Driver/Passenger operate one bus) ─
   const [busList, setBusList] = useState<Array<{ id: string; name: string; registrationNumber: string; totalSeats: number; layoutType?: string; routeName?: string | null; routeCode?: string | null }>>([])
@@ -313,17 +368,23 @@ export default function Home() {
   useEffect(() => {
     const load = async () => {
       setLoading(true)
-      // Load owners list for the switcher
+      // Fetch /api/me — returns the current session (if any) plus the
+      // list of demo owner emails so the sign-in card can show a
+      // "try a demo account" hint.
       try {
-        const res = await fetch('/api/owners')
+        const res = await fetch('/api/me')
         const data = await res.json()
-        if (data.owners?.length) {
-          setOwnerList(data.owners)
-          // Pick the first owner by default
-          if (!ownerId) setOwnerId(data.owners[0].id)
+        if (data.authenticated && data.owner?.id) {
+          setOwnerId(data.owner.id)
+          setOwnerMeta({ saccoName: data.sacco.name, region: data.sacco.region })
+        } else {
+          setOwnerId(null)
+        }
+        if (data.demoOwners?.length) {
+          setOwnerList(data.demoOwners)
         }
       } catch (e) {
-        console.error('Failed to fetch owners list', e)
+        console.error('Failed to fetch /api/me', e)
       }
       await fetchBusData()
       await fetchGpsData()
@@ -331,6 +392,55 @@ export default function Home() {
     }
     load()
   }, [])
+
+  // Whenever the NextAuth session changes (login / logout), re-sync.
+  useEffect(() => {
+    if (sessionOwnerId) {
+      setOwnerId(sessionOwnerId)
+    } else if (status === 'unauthenticated') {
+      // Don't wipe ownerId on initial loading state — only when we
+      // definitively know the user is signed out.
+      setOwnerId(null)
+    }
+  }, [sessionOwnerId, status])
+
+  // ─── Sign-in handler ───────────────────────────────────────────
+  const handleSignIn = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!signInEmail || !signInPassword) {
+      toast.error('Email and password are required')
+      return
+    }
+    setSignInLoading(true)
+    try {
+      const result = await signIn('credentials', {
+        email: signInEmail,
+        password: signInPassword,
+        redirect: false,
+      })
+      if (result?.error) {
+        toast.error('Invalid email or password')
+      } else {
+        toast.success('Signed in!')
+        // Force a session refresh — NextAuth's useSession will pick
+        // this up automatically, but we also reload to be safe.
+        setTimeout(() => window.location.reload(), 400)
+      }
+    } catch (err) {
+      toast.error('Sign-in failed')
+    } finally {
+      setSignInLoading(false)
+    }
+  }
+
+  const handleSignOut = async () => {
+    await signOut({ redirect: false })
+    setOwnerId(null)
+    setBusData(null)
+    setTripData(null)
+    setFleetData(null)
+    toast.info('Signed out')
+  }
 
   // When ownerId changes, fetch the SACCO's bus list and refresh fleet
   useEffect(() => {
@@ -505,70 +615,164 @@ export default function Home() {
   ]
 
   // ─── Loading state ────────────────────────────────────────────
-  if (loading) {
+  if (loading || status === 'loading') {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-emerald-50/50">
+      <div className="min-h-screen flex items-center justify-center bg-blue-50/50">
         <motion.div
           initial={{ opacity: 0, scale: 0.8 }}
           animate={{ opacity: 1, scale: 1 }}
           className="text-center"
         >
-          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-emerald-500 flex items-center justify-center animate-pulse">
-            <Bus className="w-8 h-8 text-white" />
+          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-blue-700 flex items-center justify-center animate-pulse">
+            <Bus className="w-8 h-8 text-yellow-300" />
           </div>
-          <h2 className="text-xl font-bold text-emerald-800">MatatuLink</h2>
-          <p className="text-emerald-600 text-sm mt-1">Loading bus data...</p>
+          <h2 className="text-xl font-bold text-blue-900">MatatuLink</h2>
+          <p className="text-blue-600 text-sm mt-1">Loading…</p>
+        </motion.div>
+      </div>
+    )
+  }
+
+  // ─── Sign-in screen (unauthenticated) ────────────────────────
+  if (!ownerId) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-900 via-blue-800 to-blue-950 p-4">
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="w-full max-w-md"
+        >
+          <div className="text-center mb-6">
+            <div className="w-16 h-16 mx-auto mb-3 rounded-2xl bg-yellow-400 flex items-center justify-center shadow-xl">
+              <Bus className="w-8 h-8 text-blue-900" />
+            </div>
+            <h1 className="text-2xl font-bold text-white">MatatuLink</h1>
+            <p className="text-blue-200 text-sm mt-1">Kenyan Matatu System · SACCO Owner Sign-in</p>
+          </div>
+
+          <Card className="bg-white/95 backdrop-blur shadow-2xl">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-lg flex items-center gap-2 text-blue-900">
+                <LogIn className="w-5 h-5 text-blue-700" />
+                Sign in to your SACCO
+              </CardTitle>
+              <CardDescription>
+                Each owner only sees their own SACCO&apos;s buses, routes, and revenue.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <form onSubmit={handleSignIn} className="space-y-3">
+                <div>
+                  <Label className="text-xs font-medium text-gray-600 flex items-center gap-1">
+                    <Mail className="w-3 h-3" /> Email
+                  </Label>
+                  <Input
+                    type="email"
+                    placeholder="owner@sacco.co.ke"
+                    value={signInEmail}
+                    onChange={e => setSignInEmail(e.target.value)}
+                    className="mt-1"
+                    autoFocus
+                  />
+                </div>
+                <div>
+                  <Label className="text-xs font-medium text-gray-600 flex items-center gap-1">
+                    <Lock className="w-3 h-3" /> Password
+                  </Label>
+                  <Input
+                    type="password"
+                    placeholder="••••••••"
+                    value={signInPassword}
+                    onChange={e => setSignInPassword(e.target.value)}
+                    className="mt-1"
+                  />
+                </div>
+                <Button
+                  type="submit"
+                  disabled={signInLoading}
+                  className="w-full bg-blue-700 hover:bg-blue-800 text-white"
+                >
+                  {signInLoading ? 'Signing in…' : (
+                    <>
+                      <LogIn className="w-4 h-4 mr-2" />
+                      Sign in
+                    </>
+                  )}
+                </Button>
+              </form>
+
+              {ownerList.length > 0 && (
+                <div className="mt-4 pt-4 border-t border-gray-100">
+                  <p className="text-[11px] uppercase tracking-wide text-gray-500 mb-2">
+                    Demo accounts (click to prefill)
+                  </p>
+                  <div className="space-y-1.5">
+                    {ownerList.map(o => (
+                      <button
+                        key={o.email}
+                        onClick={() => {
+                          setSignInEmail(o.email)
+                          // Both demo accounts use the same password hint
+                          setSignInPassword(o.region === 'Nairobi' ? 'nairobi123' : 'matatu123')
+                        }}
+                        className="w-full text-left p-2 rounded border border-blue-100 bg-blue-50/40 hover:bg-blue-100 transition-colors"
+                      >
+                        <p className="text-xs font-medium text-blue-900">{o.name} · {o.saccoName}</p>
+                        <p className="text-[10px] text-gray-500">{o.email} · {o.region}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          <p className="text-center text-blue-300 text-xs mt-4">
+            © 2026 MatatuLink · Built for Kenyan SACCOs
+          </p>
         </motion.div>
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-gradient-to-b from-emerald-50/80 to-white">
+    <div className="min-h-screen flex flex-col bg-gradient-to-b from-blue-50/80 to-white">
       {/* ─── Header ─────────────────────────────────────────────── */}
-      <header className="sticky top-0 z-50 bg-emerald-700 text-white shadow-lg">
+      <header className="sticky top-0 z-50 bg-blue-800 text-white shadow-lg">
         <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-emerald-500 flex items-center justify-center shadow-md">
-              <Bus className="w-5 h-5" />
+            <div className="w-10 h-10 rounded-full bg-yellow-400 flex items-center justify-center shadow-md">
+              <Bus className="w-5 h-5 text-blue-900" />
             </div>
             <div>
               <h1 className="text-lg font-bold tracking-tight">MatatuLink</h1>
-              <p className="text-emerald-200 text-xs">Kenyan Matatu System</p>
+              <p className="text-blue-200 text-xs">Kenyan Matatu System</p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 flex-wrap">
-            {/* SACCO / Owner switcher (demo auth) */}
-            {ownerList.length > 0 && (
+            {/* SACCO identity (post-NextAuth login) */}
+            {ownerMeta && (
               <div className="flex flex-col text-right">
-                <label className="text-[10px] text-emerald-200 mb-0.5 flex items-center gap-1 justify-end">
+                <span className="text-[10px] text-blue-200 mb-0.5 flex items-center gap-1 justify-end">
                   <Building2 className="w-3 h-3" /> SACCO
-                </label>
-                <select
-                  value={ownerId ?? ''}
-                  onChange={(e) => setOwnerId(e.target.value)}
-                  className="bg-emerald-600 text-white text-xs rounded-md px-2 py-1 border border-emerald-400 max-w-[200px]"
-                >
-                  {ownerList.map(o => (
-                    <option key={o.id} value={o.id} className="text-black">
-                      {o.saccoName} — {o.region}
-                    </option>
-                  ))}
-                </select>
+                </span>
+                <span className="bg-blue-700 text-white text-xs rounded-md px-2 py-1 border border-blue-500 max-w-[200px] truncate">
+                  {ownerMeta.saccoName} — {ownerMeta.region}
+                </span>
               </div>
             )}
 
             {/* Bus selector */}
             {busList.length > 0 && (
               <div className="flex flex-col text-right">
-                <label className="text-[10px] text-emerald-200 mb-0.5 flex items-center gap-1 justify-end">
+                <label className="text-[10px] text-blue-200 mb-0.5 flex items-center gap-1 justify-end">
                   <Bus className="w-3 h-3" /> Active Bus
                 </label>
                 <select
                   value={selectedBusId ?? ''}
                   onChange={(e) => setSelectedBusId(e.target.value)}
-                  className="bg-emerald-600 text-white text-xs rounded-md px-2 py-1 border border-emerald-400 max-w-[200px]"
+                  className="bg-blue-700 text-white text-xs rounded-md px-2 py-1 border border-blue-500 max-w-[200px]"
                 >
                   {busList.map(b => (
                     <option key={b.id} value={b.id} className="text-black">
@@ -578,13 +782,24 @@ export default function Home() {
                 </select>
               </div>
             )}
+
+            {/* Sign-out */}
+            <Button
+              onClick={handleSignOut}
+              size="sm"
+              variant="outline"
+              className="bg-yellow-400 hover:bg-yellow-300 text-blue-900 border-yellow-300 font-semibold"
+            >
+              <LogOut className="w-3.5 h-3.5 mr-1" />
+              Sign out
+            </Button>
           </div>
         </div>
 
         {/* Secondary bar: route + active bus summary */}
         {busData && (
-          <div className="bg-emerald-800/50 border-t border-emerald-600">
-            <div className="max-w-5xl mx-auto px-4 py-1.5 flex items-center justify-between text-xs text-emerald-100 flex-wrap gap-1">
+          <div className="bg-blue-900/50 border-t border-blue-600">
+            <div className="max-w-5xl mx-auto px-4 py-1.5 flex items-center justify-between text-xs text-blue-100 flex-wrap gap-1">
               <span className="flex items-center gap-1.5">
                 <RouteIcon className="w-3 h-3" />
                 {busData.route?.code ? `Route ${busData.route.code}` : 'No code'} • {busData.route?.name || 'No route assigned'}
@@ -610,7 +825,7 @@ export default function Home() {
                 }}
                 className={`flex-1 flex items-center justify-center gap-1.5 py-3 text-sm font-medium transition-all border-b-2 ${
                   activeTab === tab.key
-                    ? 'border-emerald-600 text-emerald-700 bg-emerald-50/50'
+                    ? 'border-blue-700 text-blue-800 bg-blue-50/60'
                     : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
                 }`}
               >
@@ -751,7 +966,10 @@ function PassengerPanel({
   const [confirmed, setConfirmed] = useState(false)
 
   const selectedStopData = stops.find(s => s.name === selectedStop)
-  const fare = selectedStopData ? (selectedStopData.order - (currentStopIndex + 1)) * 20 + 30 : 0
+  // Fare matrix: fare = (alightingStop.fareFromOrigin) − (boardingStop.fareFromOrigin).
+  // For custom (free-text) alighting, default to the last stop's fare.
+  const usingCustom = customStop.trim().length > 0
+  const fare = computeFare(stops, currentStopIndex, usingCustom ? null : selectedStop, usingCustom)
 
   // Leaflet state for mini tracker (must be before any early return)
   const [miniLeafletReady, setMiniLeafletReady] = useState(false)
@@ -788,7 +1006,8 @@ function PassengerPanel({
   }
 
   const handlePay = async () => {
-    if (!selectedSeat || !selectedStop || !paymentMethod) return
+    if (!selectedSeat || !paymentMethod) return
+    if (!selectedStop && !usingCustom) return
     if (paymentMethod === 'mpesa' && !mpesaPhone) {
       toast.error('Please enter your M-Pesa phone number')
       return
@@ -796,7 +1015,9 @@ function PassengerPanel({
 
     setProcessing(true)
     try {
-      const stopOrder = selectedStopData?.order || 1
+      const stopOrder = usingCustom
+        ? (stops[stops.length - 1]?.order ?? 1)  // custom drop-off: treat as last stop
+        : (selectedStopData?.order || 1)
       const res = await fetch('/api/passengers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -805,8 +1026,9 @@ function PassengerPanel({
           phone: paymentMethod === 'mpesa' ? mpesaPhone : null,
           seatNumber: selectedSeat,
           boardingStop: stops[currentStopIndex]?.name || 'Unknown',
-          alightingStop: customStop || selectedStop,
+          alightingStop: usingCustom ? customStop.trim() : selectedStop,
           alightingStopOrder: stopOrder,
+          isCustomAlighting: usingCustom,
           fare,
           paymentMethod,
           busId: busData?.id,
@@ -830,8 +1052,9 @@ function PassengerPanel({
             phone: paymentMethod === 'mpesa' ? mpesaPhone : null,
             seatNumber: selectedSeat,
             boardingStop: stops[currentStopIndex]?.name || 'Unknown',
-            alightingStop: customStop || selectedStop,
+            alightingStop: usingCustom ? customStop.trim() : selectedStop,
             alightingStopOrder: stopOrder,
+            isCustomAlighting: usingCustom,
             fare,
             paymentStatus: 'paid',
             paymentMethod,
@@ -870,13 +1093,13 @@ function PassengerPanel({
         <motion.div
           animate={{ scale: [1, 1.2, 1] }}
           transition={{ duration: 0.5, repeat: 2 }}
-          className="w-20 h-20 rounded-full bg-emerald-100 flex items-center justify-center mb-6"
+          className="w-20 h-20 rounded-full bg-blue-100 flex items-center justify-center mb-6"
         >
-          <CheckCircle2 className="w-10 h-10 text-emerald-600" />
+          <CheckCircle2 className="w-10 h-10 text-blue-600" />
         </motion.div>
-        <h2 className="text-2xl font-bold text-emerald-800 mb-2">You&apos;re all set! 🎉</h2>
+        <h2 className="text-2xl font-bold text-blue-800 mb-2">You&apos;re all set! 🎉</h2>
         <p className="text-gray-600">Seat {selectedSeat} • {customStop || selectedStop}</p>
-        <p className="text-emerald-600 font-semibold mt-1">KES {fare}</p>
+        <p className="text-blue-600 font-semibold mt-1">KES {fare}</p>
       </motion.div>
     )
   }
@@ -901,7 +1124,7 @@ function PassengerPanel({
     <div className="space-y-6">
       {/* Header */}
       <div className="text-center">
-        <h2 className="text-2xl font-bold text-emerald-800">Welcome aboard! 🚌</h2>
+        <h2 className="text-2xl font-bold text-blue-800">Welcome aboard! 🚌</h2>
         <p className="text-gray-500 mt-1">Select your seat and destination</p>
       </div>
 
@@ -927,16 +1150,16 @@ function PassengerPanel({
       )}
 
       {/* Mini Live Bus Tracker */}
-      <Card className="border-emerald-200 bg-gradient-to-br from-emerald-50 to-teal-50">
+      <Card className="border-blue-200 bg-gradient-to-br from-blue-50 to-teal-50">
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between">
-            <CardTitle className="text-base flex items-center gap-2 text-emerald-800">
-              <Navigation className="w-4 h-4 text-emerald-600" />
+            <CardTitle className="text-base flex items-center gap-2 text-blue-800">
+              <Navigation className="w-4 h-4 text-blue-600" />
               Live Bus Tracker
             </CardTitle>
             <button
               onClick={() => setShowMiniMap(s => !s)}
-              className="text-xs text-emerald-600 hover:text-emerald-800 underline"
+              className="text-xs text-blue-600 hover:text-blue-800 underline"
             >
               {showMiniMap ? 'Hide map' : 'Show map'}
             </button>
@@ -945,18 +1168,18 @@ function PassengerPanel({
         <CardContent className="space-y-3">
           {/* GPS status row */}
           <div className="flex items-center gap-3 flex-wrap text-xs">
-            <span className="flex items-center gap-1.5 px-2 py-1 rounded-full bg-white border border-emerald-200">
-              <span className={`w-2 h-2 rounded-full ${gpsData?.speed ? 'bg-emerald-500 animate-pulse' : 'bg-gray-300'}`} />
+            <span className="flex items-center gap-1.5 px-2 py-1 rounded-full bg-white border border-blue-200">
+              <span className={`w-2 h-2 rounded-full ${gpsData?.speed ? 'bg-blue-500 animate-pulse' : 'bg-gray-300'}`} />
               {gpsData?.speed ? 'Live' : 'Waiting'}
             </span>
             {gpsData?.speed !== undefined && (
-              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-emerald-200">
-                <span className="text-emerald-600 font-bold">{gpsData.speed}</span>
+              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-blue-200">
+                <span className="text-blue-600 font-bold">{gpsData.speed}</span>
                 <span className="text-gray-500">km/h</span>
               </span>
             )}
             {gpsData?.routeProgressPercent !== undefined && (
-              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-emerald-100 border border-emerald-300 text-emerald-700 font-medium">
+              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-blue-100 border border-blue-300 text-blue-700 font-medium">
                 {gpsData.routeProgressPercent}% route
               </span>
             )}
@@ -966,7 +1189,7 @@ function PassengerPanel({
               </span>
             )}
             {gpsData?.currentLocation && (
-              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-emerald-200 text-gray-500">
+              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-blue-200 text-gray-500">
                 {gpsData.currentLocation.lat.toFixed(4)}, {gpsData.currentLocation.lng.toFixed(4)}
               </span>
             )}
@@ -1005,7 +1228,7 @@ function PassengerPanel({
           )}
 
           {/* Next stop callout */}
-          <div className="flex items-center gap-2 text-xs text-emerald-700 bg-white/60 rounded-lg p-2">
+          <div className="flex items-center gap-2 text-xs text-blue-700 bg-white/60 rounded-lg p-2">
             <MapPin className="w-3.5 h-3.5 shrink-0" />
             <span>
               {gpsData?.currentLocation ? 'Now approaching ' : 'Currently at '}
@@ -1026,17 +1249,17 @@ function PassengerPanel({
       </Card>
 
       {/* Route Progress Tracker */}
-      <Card className="bg-gradient-to-r from-emerald-50 to-teal-50 border-emerald-200">
+      <Card className="bg-gradient-to-r from-blue-50 to-teal-50 border-blue-200">
         <CardContent className="p-4">
           <div className="flex items-center gap-2 mb-2">
-            <Navigation className="w-4 h-4 text-emerald-600" />
-            <span className="text-sm font-semibold text-emerald-800">Route Progress</span>
+            <Navigation className="w-4 h-4 text-blue-600" />
+            <span className="text-sm font-semibold text-blue-800">Route Progress</span>
           </div>
           <div className="relative flex items-center justify-between gap-1">
             {/* Connecting line */}
             <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-gray-200 -translate-y-1/2" />
             <div
-              className="absolute top-1/2 left-0 h-0.5 bg-emerald-500 -translate-y-1/2 transition-all duration-500"
+              className="absolute top-1/2 left-0 h-0.5 bg-blue-500 -translate-y-1/2 transition-all duration-500"
               style={{ width: `${stops.length > 1 ? (currentStopIndex / (stops.length - 1)) * 100 : 0}%` }}
             />
             {/* Stop dots */}
@@ -1045,9 +1268,9 @@ function PassengerPanel({
                 <div
                   className={`w-4 h-4 rounded-full border-2 transition-all duration-300 ${
                     i < currentStopIndex
-                      ? 'bg-emerald-500 border-emerald-500'
+                      ? 'bg-blue-500 border-blue-500'
                       : i === currentStopIndex
-                      ? 'bg-emerald-500 border-emerald-600 ring-2 ring-emerald-300 scale-125'
+                      ? 'bg-blue-500 border-blue-600 ring-2 ring-yellow-300 scale-125'
                       : 'bg-white border-gray-300'
                   }`}
                 >
@@ -1057,7 +1280,7 @@ function PassengerPanel({
                 </div>
                 <span
                   className={`text-[9px] mt-1 max-w-[40px] text-center leading-tight truncate ${
-                    i === currentStopIndex ? 'font-bold text-emerald-700' : 'text-gray-400'
+                    i === currentStopIndex ? 'font-bold text-blue-700' : 'text-gray-400'
                   }`}
                 >
                   {stop.name.split(' ')[0]}
@@ -1067,11 +1290,11 @@ function PassengerPanel({
           </div>
           <div className="flex items-center justify-center gap-2 mt-3">
             <span className="text-xs text-gray-500">Current:</span>
-            <Badge variant="default" className="bg-emerald-600 text-xs">
+            <Badge variant="default" className="bg-blue-600 text-xs">
               {stops[currentStopIndex]?.name || 'Unknown'}
             </Badge>
             {gpsData && gpsData.speed > 0 && (
-              <span className="text-xs text-emerald-600 font-medium">
+              <span className="text-xs text-blue-600 font-medium">
                 • {gpsData.speed} km/h
               </span>
             )}
@@ -1086,14 +1309,14 @@ function PassengerPanel({
             <button
               onClick={() => s < step && setStep(s)}
               className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-all ${
-                step === s ? 'bg-emerald-600 text-white scale-110' :
-                s < step ? 'bg-emerald-200 text-emerald-700' :
+                step === s ? 'bg-blue-600 text-white scale-110' :
+                s < step ? 'bg-blue-200 text-blue-700' :
                 'bg-gray-100 text-gray-400'
               }`}
             >
               {s < step ? <CheckCircle2 className="w-4 h-4" /> : s}
             </button>
-            {s < 3 && <div className={`w-12 h-0.5 ${s < step ? 'bg-emerald-400' : 'bg-gray-200'}`} />}
+            {s < 3 && <div className={`w-12 h-0.5 ${s < step ? 'bg-blue-400' : 'bg-gray-200'}`} />}
           </React.Fragment>
         ))}
       </div>
@@ -1103,14 +1326,14 @@ function PassengerPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <Armchair className="w-5 h-5 text-emerald-600" />
+              <Armchair className="w-5 h-5 text-blue-600" />
               Pick Your Seat
             </CardTitle>
             <CardDescription>
               <span className="flex items-center gap-3 text-xs mt-1">
-                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-emerald-100 border border-emerald-400" /> Available</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-100 border border-blue-400" /> Available</span>
                 <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-100 border border-red-400" /> Occupied</span>
-                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-emerald-400 border border-emerald-600" /> Selected</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-400 border border-blue-600" /> Selected</span>
               </span>
             </CardDescription>
           </CardHeader>
@@ -1156,7 +1379,7 @@ function PassengerPanel({
               >
                 <Button
                   onClick={() => setStep(2)}
-                  className="bg-emerald-600 hover:bg-emerald-700"
+                  className="bg-blue-600 hover:bg-blue-700"
                 >
                   Continue with Seat {selectedSeat} <ChevronRight className="w-4 h-4 ml-1" />
                 </Button>
@@ -1171,54 +1394,77 @@ function PassengerPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <MapPin className="w-5 h-5 text-emerald-600" />
+              <MapPin className="w-5 h-5 text-blue-700" />
               Select Your Stop
             </CardTitle>
-            <CardDescription>Where are you getting off?</CardDescription>
+            <CardDescription>
+              Where are you getting off? Fares are auto-calculated from the SACCO&apos;s fare matrix.
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar pr-1">
-              {stops.filter(s => s.order > currentStopIndex).map(stop => (
-                <button
-                  key={stop.id}
-                  onClick={() => { setSelectedStop(stop.name); setCustomStop('') }}
-                  className={`w-full flex items-center gap-3 p-3 rounded-lg border-2 transition-all text-left ${
-                    selectedStop === stop.name
-                      ? 'border-emerald-500 bg-emerald-50'
-                      : 'border-gray-200 hover:border-emerald-300 hover:bg-emerald-50/30'
-                  }`}
-                >
-                  <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-700 font-bold text-xs shrink-0">
-                    {stop.order}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium text-sm truncate">{stop.name}</p>
-                    <div className="flex items-center gap-2 mt-0.5">
-                      <Badge variant="outline" className="text-xs">
-                        {stop.isStage ? 'Stage' : 'Custom'}
-                      </Badge>
-                      <span className="text-xs text-gray-500">
-                        KES {((stop.order - (currentStopIndex + 1)) * 20 + 30)}
-                      </span>
+              {stops.filter(s => s.order > currentStopIndex).map(stop => {
+                const segmentFare = computeFare(stops, currentStopIndex, stop.name, false)
+                return (
+                  <button
+                    key={stop.id}
+                    onClick={() => { setSelectedStop(stop.name); setCustomStop('') }}
+                    className={`w-full flex items-center gap-3 p-3 rounded-lg border-2 transition-all text-left ${
+                      selectedStop === stop.name
+                        ? 'border-blue-600 bg-blue-50'
+                        : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50/30'
+                    }`}
+                  >
+                    <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-700 font-bold text-xs shrink-0">
+                      {stop.order}
                     </div>
-                  </div>
-                  {selectedStop === stop.name && (
-                    <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
-                  )}
-                </button>
-              ))}
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium text-sm truncate">{stop.name}</p>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <Badge variant="outline" className="text-xs">
+                          {stop.isStage ? 'Stage' : 'Custom'}
+                        </Badge>
+                        {typeof stop.fareFromOrigin === 'number' && (
+                          <span className="text-[10px] text-gray-400">
+                            fare from origin: KES {stop.fareFromOrigin}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <span className="text-sm font-semibold text-blue-700 shrink-0">
+                      KES {segmentFare}
+                    </span>
+                    {selectedStop === stop.name && (
+                      <CheckCircle2 className="w-5 h-5 text-blue-700 shrink-0" />
+                    )}
+                  </button>
+                )
+              })}
             </div>
 
             <Separator />
 
-            <div>
-              <p className="text-sm font-medium text-gray-600 mb-2">Or enter a custom stop:</p>
+            <div className="bg-yellow-50 border border-yellow-300 rounded-lg p-3">
+              <p className="text-sm font-medium text-yellow-900 mb-2 flex items-center gap-1.5">
+                <MapPin className="w-4 h-4 text-yellow-700" />
+                Or enter a custom drop-off landmark
+              </p>
+              <p className="text-[11px] text-yellow-800 mb-2 leading-relaxed">
+                For places the driver knows but that aren&apos;t on the registered route —
+                e.g. <em>&quot;near Naivas Supermarket&quot;</em> or <em>&quot;after the blue mosque&quot;</em>.
+                The driver and conductor will see this flagged on their seat map.
+              </p>
               <Input
                 placeholder="e.g., Near Naivas Supermarket"
                 value={customStop}
                 onChange={e => { setCustomStop(e.target.value); setSelectedStop('') }}
-                className="text-sm"
+                className="text-sm border-yellow-400 focus-visible:ring-yellow-500"
               />
+              {usingCustom && (
+                <p className="text-xs text-yellow-800 mt-2">
+                  Custom drop-off fare: <strong>KES {fare}</strong> (charged to the end of the route — conductor can adjust).
+                </p>
+              )}
             </div>
 
             <div className="flex gap-2 pt-2">
@@ -1226,7 +1472,7 @@ function PassengerPanel({
               <Button
                 onClick={() => setStep(3)}
                 disabled={!selectedStop && !customStop}
-                className="bg-emerald-600 hover:bg-emerald-700 flex-1"
+                className="bg-blue-700 hover:bg-blue-800 flex-1"
               >
                 Continue <ChevronRight className="w-4 h-4 ml-1" />
               </Button>
@@ -1240,16 +1486,16 @@ function PassengerPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <CreditCard className="w-5 h-5 text-emerald-600" />
+              <CreditCard className="w-5 h-5 text-blue-600" />
               Payment
             </CardTitle>
             <CardDescription>Choose your payment method</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="bg-emerald-50 rounded-lg p-4 text-center">
-              <p className="text-sm text-emerald-600">Total Fare</p>
-              <p className="text-3xl font-bold text-emerald-800">KES {fare}</p>
-              <p className="text-xs text-emerald-500 mt-1">
+            <div className="bg-blue-50 rounded-lg p-4 text-center">
+              <p className="text-sm text-blue-600">Total Fare</p>
+              <p className="text-3xl font-bold text-blue-800">KES {fare}</p>
+              <p className="text-xs text-blue-500 mt-1">
                 Seat {selectedSeat} → {customStop || selectedStop}
               </p>
             </div>
@@ -1267,8 +1513,8 @@ function PassengerPanel({
                   onClick={() => setPaymentMethod(method.key)}
                   className={`flex flex-col items-center gap-1 p-3 rounded-lg border-2 transition-all ${
                     paymentMethod === method.key
-                      ? 'border-emerald-500 bg-emerald-50'
-                      : 'border-gray-200 hover:border-emerald-300'
+                      ? 'border-blue-500 bg-blue-50'
+                      : 'border-gray-200 hover:border-blue-300'
                   }`}
                 >
                   <span className={method.color}>{method.icon}</span>
@@ -1298,7 +1544,7 @@ function PassengerPanel({
               <Button
                 onClick={handlePay}
                 disabled={!paymentMethod || processing || (paymentMethod === 'mpesa' && !mpesaPhone)}
-                className="bg-emerald-600 hover:bg-emerald-700 flex-1"
+                className="bg-blue-600 hover:bg-blue-700 flex-1"
               >
                 {processing ? (
                   <span className="flex items-center gap-2">
@@ -1321,27 +1567,27 @@ function PassengerPanel({
 
       {/* Summary card */}
       {selectedSeat && (
-        <Card className="bg-gradient-to-r from-emerald-50 to-teal-50 border-emerald-200">
+        <Card className="bg-gradient-to-r from-blue-50 to-teal-50 border-blue-200">
           <CardContent className="p-4">
-            <h4 className="font-semibold text-emerald-800 text-sm mb-2">Your Trip Summary</h4>
+            <h4 className="font-semibold text-blue-800 text-sm mb-2">Your Trip Summary</h4>
             <div className="grid grid-cols-2 gap-2 text-sm">
               <div className="flex items-center gap-2">
-                <Armchair className="w-4 h-4 text-emerald-600" />
+                <Armchair className="w-4 h-4 text-blue-600" />
                 <span className="text-gray-600">Seat:</span>
                 <span className="font-medium">{selectedSeat}</span>
               </div>
               <div className="flex items-center gap-2">
-                <MapPin className="w-4 h-4 text-emerald-600" />
+                <MapPin className="w-4 h-4 text-blue-600" />
                 <span className="text-gray-600">To:</span>
                 <span className="font-medium truncate">{customStop || selectedStop || '—'}</span>
               </div>
               <div className="flex items-center gap-2">
-                <DollarSign className="w-4 h-4 text-emerald-600" />
+                <DollarSign className="w-4 h-4 text-blue-600" />
                 <span className="text-gray-600">Fare:</span>
                 <span className="font-medium">KES {fare}</span>
               </div>
               <div className="flex items-center gap-2">
-                <CreditCard className="w-4 h-4 text-emerald-600" />
+                <CreditCard className="w-4 h-4 text-blue-600" />
                 <span className="text-gray-600">Payment:</span>
                 <span className="font-medium capitalize">{paymentMethod || '—'}</span>
               </div>
@@ -1392,14 +1638,36 @@ function ConductorPanel({
     p => p.alightingStopOrder <= currentStopIndex + 2
   )
 
+  // When conductor picks an alighting stop from the dropdown, auto-suggest
+  // the fare from the matrix. They can still override the input afterwards.
+  useEffect(() => {
+    if (boardAlighting) {
+      const suggested = computeFare(stops, currentStopIndex, boardAlighting, false)
+      setBoardFare(String(suggested))
+    }
+  }, [boardAlighting, stops, currentStopIndex])
+
+  // When custom stop is typed, default to end-of-route fare
+  useEffect(() => {
+    if (boardCustomStop.trim()) {
+      const suggested = computeFare(stops, currentStopIndex, null, true)
+      setBoardFare(String(suggested))
+    }
+  }, [boardCustomStop, stops, currentStopIndex])
+
   const handleBoard = async () => {
-    if (!boardSeat || !boardAlighting || !boardFare) {
-      toast.error('Please fill in required fields')
+    const usingCustom = boardCustomStop.trim().length > 0
+    if (!boardSeat || (!boardAlighting && !usingCustom) || !boardFare) {
+      toast.error('Please fill in required fields (seat, alighting stop, and fare)')
       return
     }
     setBoarding(true)
     try {
       const alightingStopData = stops.find(s => s.name === boardAlighting)
+      const stopOrder = usingCustom
+        ? (stops[stops.length - 1]?.order ?? 1)
+        : (alightingStopData?.order || 1)
+      const finalAlighting = usingCustom ? boardCustomStop.trim() : boardAlighting
       const res = await fetch('/api/passengers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1408,8 +1676,9 @@ function ConductorPanel({
           phone: boardPhone || null,
           seatNumber: parseInt(boardSeat),
           boardingStop: stops[currentStopIndex]?.name || 'Unknown',
-          alightingStop: boardCustomStop || boardAlighting,
-          alightingStopOrder: alightingStopData?.order || 1,
+          alightingStop: finalAlighting,
+          alightingStopOrder: stopOrder,
+          isCustomAlighting: usingCustom,
           fare: parseFloat(boardFare),
           paymentMethod: boardPayMethod || null,
           busId: busData?.id,
@@ -1432,8 +1701,9 @@ function ConductorPanel({
             phone: boardPhone || null,
             seatNumber: parseInt(boardSeat),
             boardingStop: stops[currentStopIndex]?.name || 'Unknown',
-            alightingStop: boardCustomStop || boardAlighting,
-            alightingStopOrder: alightingStopData?.order || 1,
+            alightingStop: finalAlighting,
+            alightingStopOrder: stopOrder,
+            isCustomAlighting: usingCustom,
             fare: parseFloat(boardFare),
             paymentStatus: boardPayMethod ? 'paid' : 'unpaid',
             paymentMethod: boardPayMethod || null,
@@ -1531,12 +1801,12 @@ function ConductorPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <Armchair className="w-5 h-5 text-emerald-600" />
+              <Armchair className="w-5 h-5 text-blue-600" />
               Seat Map
             </CardTitle>
             <CardDescription>
               <span className="flex flex-wrap items-center gap-2 text-xs mt-1">
-                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-emerald-100 border border-emerald-400" /> Free</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-100 border border-blue-400" /> Free</span>
                 <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-100 border border-red-400" /> Alighting soon</span>
                 <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-orange-100 border border-orange-400" /> Far stop</span>
                 <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-yellow-100 border border-yellow-500 border-dashed" /> Unpaid</span>
@@ -1611,7 +1881,19 @@ function ConductorPanel({
                                       </div>
                                       <div>
                                         <p className="text-gray-500">Alighting</p>
-                                        <p className="font-medium">{seat.passenger.alightingStop}</p>
+                                        <p className="font-medium flex items-center gap-1.5 flex-wrap">
+                                          {seat.passenger.alightingStop}
+                                          {seat.passenger.isCustomAlighting && (
+                                            <Badge className="bg-yellow-400 text-yellow-900 border-yellow-500 text-[10px]">
+                                              CUSTOM DROP-OFF
+                                            </Badge>
+                                          )}
+                                        </p>
+                                        {seat.passenger.isCustomAlighting && (
+                                          <p className="text-[10px] text-yellow-700 mt-0.5">
+                                            Landmark the driver knows — not on the registered route.
+                                          </p>
+                                        )}
                                       </div>
                                       <div>
                                         <p className="text-gray-500">Fare</p>
@@ -1623,7 +1905,7 @@ function ConductorPanel({
                                       </div>
                                     </div>
                                     <Button
-                                      className="w-full bg-emerald-600 hover:bg-emerald-700"
+                                      className="w-full bg-blue-600 hover:bg-blue-700"
                                       onClick={() => handleAlight(seat.passenger!.id, seat.number)}
                                     >
                                       <UserCheck className="w-4 h-4 mr-2" />
@@ -1701,7 +1983,7 @@ function ConductorPanel({
                                 </div>
                               </div>
                               <Button
-                                className="w-full bg-emerald-600 hover:bg-emerald-700"
+                                className="w-full bg-blue-600 hover:bg-blue-700"
                                 onClick={() => handleAlight(seat.passenger!.id, seat.number)}
                               >
                                 <UserCheck className="w-4 h-4 mr-2" />
@@ -1723,7 +2005,7 @@ function ConductorPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <User className="w-5 h-5 text-emerald-600" />
+              <User className="w-5 h-5 text-blue-600" />
               Board New Passenger
             </CardTitle>
           </CardHeader>
@@ -1798,7 +2080,7 @@ function ConductorPanel({
             <Button
               onClick={handleBoard}
               disabled={boarding || !boardSeat || !boardAlighting || !boardFare}
-              className="bg-emerald-600 hover:bg-emerald-700 mt-4 w-full"
+              className="bg-blue-600 hover:bg-blue-700 mt-4 w-full"
             >
               {boarding ? 'Boarding...' : 'Board Passenger'}
             </Button>
@@ -1825,17 +2107,24 @@ function ConductorPanel({
                   <div
                     key={p.id}
                     className={`p-3 rounded-lg border-2 ${
-                      p.alightingStopOrder <= currentStopIndex + 1
+                      p.isCustomAlighting
+                        ? 'border-yellow-400 bg-yellow-50'
+                        : p.alightingStopOrder <= currentStopIndex + 1
                         ? 'border-red-300 bg-red-50'
                         : 'border-amber-300 bg-amber-50'
                     }`}
                   >
                     <div className="flex items-center justify-between">
-                      <div>
+                      <div className="min-w-0">
                         <p className="font-medium text-sm">{p.name || 'Passenger'}</p>
-                        <p className="text-xs text-gray-500">
+                        <p className="text-xs text-gray-600">
                           Seat {p.seat?.number} → {p.alightingStop}
                         </p>
+                        {p.isCustomAlighting && (
+                          <Badge className="bg-yellow-400 text-yellow-900 border-yellow-500 text-[9px] mt-1">
+                            CUSTOM DROP-OFF
+                          </Badge>
+                        )}
                       </div>
                       <Badge variant={p.paymentStatus === 'paid' ? 'default' : 'destructive'} className="text-xs">
                         {p.paymentStatus}
@@ -1854,7 +2143,7 @@ function ConductorPanel({
                         <Button
                           size="sm"
                           onClick={() => handleMarkPaid(p.id, p.fare)}
-                          className="bg-emerald-600 hover:bg-emerald-700 text-xs"
+                          className="bg-blue-700 hover:bg-blue-800 text-xs"
                         >
                           Mark Paid
                         </Button>
@@ -1871,7 +2160,7 @@ function ConductorPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <MessageSquare className="w-5 h-5 text-emerald-600" />
+              <MessageSquare className="w-5 h-5 text-blue-600" />
               Broadcast Message
             </CardTitle>
           </CardHeader>
@@ -1884,7 +2173,7 @@ function ConductorPanel({
             <Button
               onClick={handleBroadcast}
               disabled={!broadcastText.trim()}
-              className="bg-emerald-600 hover:bg-emerald-700 w-full"
+              className="bg-blue-600 hover:bg-blue-700 w-full"
             >
               <Send className="w-4 h-4 mr-2" />
               Send Broadcast
@@ -1896,7 +2185,7 @@ function ConductorPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <BellIcon className="w-5 h-5 text-emerald-600" />
+              <BellIcon className="w-5 h-5 text-blue-600" />
               Notifications
             </CardTitle>
           </CardHeader>
@@ -2104,18 +2393,18 @@ function DriverPanel({
   return (
     <div className="space-y-6">
       {/* Current Stop - Large Display */}
-      <Card className="bg-gradient-to-br from-emerald-600 to-emerald-800 text-white">
+      <Card className="bg-gradient-to-br from-blue-600 to-blue-800 text-white">
         <CardContent className="p-6 text-center">
-          <p className="text-emerald-200 text-sm font-medium mb-1">Current Stop</p>
+          <p className="text-blue-200 text-sm font-medium mb-1">Current Stop</p>
           <h2 className="text-3xl font-bold mb-2">{currentStop?.name || 'Unknown'}</h2>
-          <p className="text-emerald-200 text-sm">Stop {currentStopIndex + 1} of {stops.length}</p>
+          <p className="text-blue-200 text-sm">Stop {currentStopIndex + 1} of {stops.length}</p>
 
           {nextStop && (
             <Button
               size="lg"
               onClick={handleArrived}
               disabled={advancing}
-              className="mt-4 bg-white text-emerald-800 hover:bg-emerald-50 font-bold text-lg px-8"
+              className="mt-4 bg-white text-blue-800 hover:bg-blue-50 font-bold text-lg px-8"
             >
               {advancing ? 'Arriving...' : (
                 <>
@@ -2155,10 +2444,10 @@ function DriverPanel({
       )}
 
       {/* GPS Tracking Control */}
-      <Card className="border-emerald-300 bg-emerald-50/30">
+      <Card className="border-blue-300 bg-blue-50/30">
         <CardHeader className="pb-3">
           <CardTitle className="text-lg flex items-center gap-2">
-            <MapPin className="w-5 h-5 text-emerald-600" />
+            <MapPin className="w-5 h-5 text-blue-600" />
             GPS Tracking
           </CardTitle>
         </CardHeader>
@@ -2178,7 +2467,7 @@ function DriverPanel({
             ) : (
               <Button
                 onClick={startGpsTracking}
-                className="bg-emerald-600 hover:bg-emerald-700 flex-1"
+                className="bg-blue-600 hover:bg-blue-700 flex-1"
               >
                 <Navigation className="w-4 h-4 mr-2" />
                 Start GPS Tracking
@@ -2189,23 +2478,23 @@ function DriverPanel({
             <div className="grid grid-cols-3 gap-2 text-center">
               <div className="bg-white rounded-lg p-2 border">
                 <p className="text-xs text-gray-500">Speed</p>
-                <p className="font-bold text-emerald-700">{gpsData.speed || 0} <span className="text-xs font-normal">km/h</span></p>
+                <p className="font-bold text-blue-700">{gpsData.speed || 0} <span className="text-xs font-normal">km/h</span></p>
               </div>
               <div className="bg-white rounded-lg p-2 border">
                 <p className="text-xs text-gray-500">Heading</p>
-                <p className="font-bold text-emerald-700">{gpsData.heading || 0}°</p>
+                <p className="font-bold text-blue-700">{gpsData.heading || 0}°</p>
               </div>
               <div className="bg-white rounded-lg p-2 border">
                 <p className="text-xs text-gray-500">Updated</p>
-                <p className="font-bold text-emerald-700 text-xs">
+                <p className="font-bold text-blue-700 text-xs">
                   {gpsData.lastUpdated ? new Date(gpsData.lastUpdated).toLocaleTimeString() : 'N/A'}
                 </p>
               </div>
             </div>
           )}
           {gpsTracking && (
-            <div className="flex items-center gap-2 text-xs text-emerald-600">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <div className="flex items-center gap-2 text-xs text-blue-600">
+              <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
               <span>Live tracking active — updating every 5s</span>
             </div>
           )}
@@ -2216,15 +2505,15 @@ function DriverPanel({
       <div className="grid grid-cols-2 gap-4">
         <Card>
           <CardContent className="p-4 text-center">
-            <Users className="w-6 h-6 text-emerald-600 mx-auto mb-1" />
-            <p className="text-2xl font-bold text-emerald-800">{occupiedCount}</p>
+            <Users className="w-6 h-6 text-blue-600 mx-auto mb-1" />
+            <p className="text-2xl font-bold text-blue-800">{occupiedCount}</p>
             <p className="text-xs text-gray-500">On Board</p>
           </CardContent>
         </Card>
         <Card>
           <CardContent className="p-4 text-center">
-            <Armchair className="w-6 h-6 text-emerald-600 mx-auto mb-1" />
-            <p className="text-2xl font-bold text-emerald-800">{emptyCount}</p>
+            <Armchair className="w-6 h-6 text-blue-600 mx-auto mb-1" />
+            <p className="text-2xl font-bold text-blue-800">{emptyCount}</p>
             <p className="text-xs text-gray-500">Empty Seats</p>
           </CardContent>
         </Card>
@@ -2234,7 +2523,7 @@ function DriverPanel({
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-lg flex items-center gap-2">
-            <Navigation className="w-5 h-5 text-emerald-600" />
+            <Navigation className="w-5 h-5 text-blue-600" />
             Route Progress
           </CardTitle>
         </CardHeader>
@@ -2248,13 +2537,13 @@ function DriverPanel({
               <div
                 key={stop.id}
                 className={`flex flex-col items-center min-w-[48px] text-center ${
-                  i <= currentStopIndex ? 'text-emerald-600' : 'text-gray-400'
+                  i <= currentStopIndex ? 'text-blue-600' : 'text-gray-400'
                 }`}
               >
                 <div
                   className={`w-3 h-3 rounded-full mb-1 ${
-                    i < currentStopIndex ? 'bg-emerald-500' :
-                    i === currentStopIndex ? 'bg-emerald-500 pulse-emerald' :
+                    i < currentStopIndex ? 'bg-blue-500' :
+                    i === currentStopIndex ? 'bg-blue-500 pulse-blue' :
                     'bg-gray-300'
                   }`}
                 />
@@ -2269,7 +2558,7 @@ function DriverPanel({
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-lg flex items-center gap-2">
-            <Activity className="w-5 h-5 text-emerald-600" />
+            <Activity className="w-5 h-5 text-blue-600" />
             Live Feed
           </CardTitle>
         </CardHeader>
@@ -2305,17 +2594,22 @@ function DriverPanel({
 
 // ═══════════════════════════════════════════════════════════════════
 // ROUTE MANAGER — let each SACCO register their own numbered routes
+//   Two ways to enter stops: paste-as-text OR upload a CSV file.
 // ═══════════════════════════════════════════════════════════════════
 function RouteManager({ ownerId, onRoutesChanged }: { ownerId: string | null; onRoutesChanged: () => void }) {
   const [routes, setRoutes] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [showForm, setShowForm] = useState(false)
+  // 'text' = paste stops in a textarea, 'csv' = upload a .csv file
+  const [inputMode, setInputMode] = useState<'text' | 'csv'>('text')
 
   // Form state
   const [name, setName] = useState('')
   const [code, setCode] = useState('')
   const [region, setRegion] = useState('')
   const [stopsText, setStopsText] = useState('')
+  const [csvFileName, setCsvFileName] = useState('')
+  const [csvParsedStops, setCsvParsedStops] = useState<Array<{ name: string; lat: number; lng: number; isStage: boolean; fareFromOrigin: number }> | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const fetchRoutes = useCallback(async () => {
@@ -2355,12 +2649,90 @@ function RouteManager({ ownerId, onRoutesChanged }: { ownerId: string | null; on
       })
   }
 
+  /**
+   * Parse a CSV file into stops. Accepts either:
+   *   - With header row: name,lat,lng,isStage,fareFromOrigin
+   *   - Without header: just rows of values in that column order.
+   * Quoted CSV values are tolerated (e.g. "Tena, Junction",-1.26,...).
+   */
+  const parseCsvText = (csv: string): Array<{ name: string; lat: number; lng: number; isStage: boolean; fareFromOrigin: number }> => {
+    const lines = csv.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+    if (!lines.length) throw new Error('CSV file is empty')
+
+    // Tiny CSV row parser: handles quoted values with embedded commas
+    const splitRow = (row: string): string[] => {
+      const out: string[] = []
+      let cur = ''
+      let inQuotes = false
+      for (let i = 0; i < row.length; i++) {
+        const c = row[i]
+        if (c === '"') {
+          if (inQuotes && row[i + 1] === '"') { cur += '"'; i++ }
+          else inQuotes = !inQuotes
+        } else if (c === ',' && !inQuotes) {
+          out.push(cur); cur = ''
+        } else {
+          cur += c
+        }
+      }
+      out.push(cur)
+      return out.map(s => s.trim())
+    }
+
+    const firstRow = splitRow(lines[0])
+    const looksLikeHeader = firstRow.some(c => /name|lat|lng|stage|fare/i.test(c))
+    const dataRows = looksLikeHeader ? lines.slice(1) : lines
+
+    return dataRows.map((line, i) => {
+      const parts = splitRow(line)
+      if (parts.length < 3) throw new Error(`Row ${i + (looksLikeHeader ? 2 : 1)}: need at least 3 columns (name, lat, lng)`)
+      const lat = parseFloat(parts[1])
+      const lng = parseFloat(parts[2])
+      if (Number.isNaN(lat) || Number.isNaN(lng)) throw new Error(`Row ${i + (looksLikeHeader ? 2 : 1)}: invalid lat/lng "${parts[1]}, ${parts[2]}"`)
+      return {
+        name: parts[0],
+        lat,
+        lng,
+        isStage: parts[3] ? parts[3].toLowerCase() === 'true' || parts[3] === '1' : true,
+        fareFromOrigin: parts[4] ? parseFloat(parts[4]) || 0 : 0,
+      }
+    })
+  }
+
+  const handleCsvUpload = async (file: File) => {
+    setError(null)
+    try {
+      const text = await file.text()
+      const parsed = parseCsvText(text)
+      if (parsed.length < 2) {
+        setError('CSV must contain at least 2 stops')
+        setCsvParsedStops(null)
+        setCsvFileName('')
+        return
+      }
+      setCsvParsedStops(parsed)
+      setCsvFileName(file.name)
+      // Also mirror into stopsText so the user can preview/edit
+      setStopsText(parsed.map(s => `${s.name}, ${s.lat}, ${s.lng}, ${s.isStage}, ${s.fareFromOrigin}`).join('\n'))
+      toast.success(`Parsed ${parsed.length} stops from ${file.name}`)
+    } catch (e: any) {
+      setError(e.message || 'Failed to parse CSV')
+      setCsvParsedStops(null)
+      setCsvFileName('')
+    }
+  }
+
   const handleCreate = async () => {
     setError(null)
     if (!ownerId) return
     if (!name.trim()) { setError('Route name is required'); return }
     try {
-      const stops = parseStops(stopsText)
+      let stops: Array<{ name: string; lat: number; lng: number; isStage: boolean; fareFromOrigin: number }>
+      if (inputMode === 'csv' && csvParsedStops) {
+        stops = csvParsedStops
+      } else {
+        stops = parseStops(stopsText)
+      }
       if (stops.length < 2) { setError('Provide at least 2 stops'); return }
 
       setLoading(true)
@@ -2376,7 +2748,7 @@ function RouteManager({ ownerId, onRoutesChanged }: { ownerId: string | null; on
         return
       }
       toast.success(`Route "${name}" created with ${stops.length} stops`)
-      setName(''); setCode(''); setStopsText('')
+      setName(''); setCode(''); setStopsText(''); setCsvParsedStops(null); setCsvFileName('')
       setShowForm(false)
       await fetchRoutes()
       onRoutesChanged()
@@ -2392,14 +2764,14 @@ function RouteManager({ ownerId, onRoutesChanged }: { ownerId: string | null; on
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between">
           <CardTitle className="text-lg flex items-center gap-2">
-            <RouteIcon className="w-5 h-5 text-emerald-600" />
+            <RouteIcon className="w-5 h-5 text-blue-700" />
             Route Manager
             <Badge variant="outline" className="text-xs ml-1">{routes.length} routes</Badge>
           </CardTitle>
           <Button
             size="sm"
             onClick={() => setShowForm(s => !s)}
-            className="bg-emerald-600 hover:bg-emerald-700"
+            className="bg-blue-700 hover:bg-blue-800"
           >
             <Plus className="w-4 h-4 mr-1" />
             {showForm ? 'Cancel' : 'Register Route'}
@@ -2411,7 +2783,7 @@ function RouteManager({ ownerId, onRoutesChanged }: { ownerId: string | null; on
       </CardHeader>
       <CardContent className="space-y-3">
         {showForm && (
-          <div className="border rounded-lg p-3 bg-emerald-50/40 space-y-2">
+          <div className="border-2 border-blue-200 rounded-lg p-3 bg-blue-50/40 space-y-3">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <div>
                 <Label className="text-xs">Route Name *</Label>
@@ -2426,23 +2798,101 @@ function RouteManager({ ownerId, onRoutesChanged }: { ownerId: string | null; on
                 <Input value={region} onChange={e => setRegion(e.target.value)} placeholder="Nairobi" />
               </div>
             </div>
+
+            {/* Input-mode toggle: Text vs CSV upload */}
             <div>
-              <Label className="text-xs">
-                Stops (one per line): <code className="bg-white px-1 rounded">Name, lat, lng, [isStage], [fare]</code>
-              </Label>
-              <Textarea
-                value={stopsText}
-                onChange={e => setStopsText(e.target.value)}
-                rows={6}
-                placeholder={'Umoja Innercore, -1.2700, 36.8900, true, 0\nUmoja Market, -1.2680, 36.8830, true, 20\nTena, -1.2640, 36.8750, true, 40'}
-                className="font-mono text-xs"
-              />
+              <Label className="text-xs mb-1.5 block">Stops input method</Label>
+              <div className="flex gap-1.5 mb-2">
+                <button
+                  onClick={() => setInputMode('text')}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium border-2 transition-all ${
+                    inputMode === 'text'
+                      ? 'bg-blue-700 text-white border-blue-700'
+                      : 'bg-white text-blue-700 border-blue-200 hover:border-blue-400'
+                  }`}
+                >
+                  Paste text
+                </button>
+                <button
+                  onClick={() => setInputMode('csv')}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium border-2 transition-all flex items-center gap-1.5 ${
+                    inputMode === 'csv'
+                      ? 'bg-blue-700 text-white border-blue-700'
+                      : 'bg-white text-blue-700 border-blue-200 hover:border-blue-400'
+                  }`}
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  Upload CSV
+                </button>
+              </div>
             </div>
+
+            {inputMode === 'text' ? (
+              <div>
+                <Label className="text-xs">
+                  Stops (one per line): <code className="bg-white px-1 rounded">Name, lat, lng, [isStage], [fareFromOrigin]</code>
+                </Label>
+                <Textarea
+                  value={stopsText}
+                  onChange={e => setStopsText(e.target.value)}
+                  rows={6}
+                  placeholder={'Umoja Innercore, -1.2700, 36.8900, true, 0\nUmoja Market, -1.2680, 36.8830, true, 20\nTena, -1.2640, 36.8750, true, 40'}
+                  className="font-mono text-xs"
+                />
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <Label className="text-xs">
+                  CSV columns: <code className="bg-white px-1 rounded">name, lat, lng, [isStage], [fareFromOrigin]</code>
+                </Label>
+                <label
+                  htmlFor="csv-upload"
+                  className="flex flex-col items-center justify-center border-2 border-dashed border-blue-300 rounded-lg p-5 cursor-pointer hover:bg-blue-50 transition-colors"
+                >
+                  <Upload className="w-6 h-6 text-blue-600 mb-2" />
+                  <span className="text-sm font-medium text-blue-800">
+                    {csvFileName ? `✓ ${csvFileName}` : 'Click to choose a .csv file'}
+                  </span>
+                  <span className="text-[10px] text-gray-500 mt-1">
+                    Header row optional. Quoted values supported.
+                  </span>
+                  <input
+                    id="csv-upload"
+                    type="file"
+                    accept=".csv,text/csv,text/plain"
+                    className="hidden"
+                    onChange={e => {
+                      const f = e.target.files?.[0]
+                      if (f) handleCsvUpload(f)
+                    }}
+                  />
+                </label>
+                {csvParsedStops && csvParsedStops.length > 0 && (
+                  <div className="text-xs text-blue-800 bg-blue-100/60 rounded p-2">
+                    <p className="font-medium mb-1">Parsed {csvParsedStops.length} stops:</p>
+                    <div className="max-h-32 overflow-y-auto custom-scrollbar space-y-0.5">
+                      {csvParsedStops.slice(0, 12).map((s, i) => (
+                        <div key={i} className="font-mono">
+                          {i + 1}. {s.name} · {s.lat}, {s.lng} · {s.isStage ? 'stage' : 'non-stage'} · KES {s.fareFromOrigin}
+                        </div>
+                      ))}
+                      {csvParsedStops.length > 12 && (
+                        <div className="text-gray-500">+ {csvParsedStops.length - 12} more…</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <p className="text-[11px] text-gray-500">
+                  Tip: export your stop list from Excel/Google Sheets as CSV, then upload it here. You can still tweak the values via the &quot;Paste text&quot; tab before creating the route.
+                </p>
+              </div>
+            )}
+
             {error && (
               <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded p-2">{error}</div>
             )}
-            <Button onClick={handleCreate} disabled={loading} className="bg-emerald-600 hover:bg-emerald-700">
-              {loading ? 'Creating...' : 'Create Route'}
+            <Button onClick={handleCreate} disabled={loading} className="bg-yellow-400 hover:bg-yellow-300 text-blue-900 font-semibold">
+              {loading ? 'Creating...' : `Create Route${(inputMode === 'csv' && csvParsedStops) ? ` (${csvParsedStops.length} stops)` : ''}`}
             </Button>
           </div>
         )}
@@ -2452,13 +2902,13 @@ function RouteManager({ ownerId, onRoutesChanged }: { ownerId: string | null; on
         ) : (
           <div className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar">
             {routes.map(r => (
-              <div key={r.id} className="border rounded-lg p-3 hover:bg-emerald-50/30">
+              <div key={r.id} className="border rounded-lg p-3 hover:bg-blue-50/30">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <p className="font-semibold text-sm">{r.name}</p>
                       {r.code && (
-                        <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 text-[10px]">
+                        <Badge variant="default" className="bg-blue-100 text-blue-700 border-blue-300 text-[10px]">
                           #{r.code}
                         </Badge>
                       )}
@@ -2575,11 +3025,11 @@ function BusManager({ ownerId, routes, onBusesChanged }: {
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between">
           <CardTitle className="text-lg flex items-center gap-2">
-            <Bus className="w-5 h-5 text-emerald-600" />
+            <Bus className="w-5 h-5 text-blue-600" />
             Bus Fleet Manager
             <Badge variant="outline" className="text-xs ml-1">{buses.length} buses</Badge>
           </CardTitle>
-          <Button size="sm" onClick={() => setShowForm(s => !s)} className="bg-emerald-600 hover:bg-emerald-700">
+          <Button size="sm" onClick={() => setShowForm(s => !s)} className="bg-blue-600 hover:bg-blue-700">
             <Plus className="w-4 h-4 mr-1" />
             {showForm ? 'Cancel' : 'Add Bus'}
           </Button>
@@ -2590,7 +3040,7 @@ function BusManager({ ownerId, routes, onBusesChanged }: {
       </CardHeader>
       <CardContent className="space-y-3">
         {showForm && (
-          <div className="border rounded-lg p-3 bg-emerald-50/40 space-y-2">
+          <div className="border rounded-lg p-3 bg-blue-50/40 space-y-2">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <div>
                 <Label className="text-xs">Bus Name *</Label>
@@ -2609,7 +3059,7 @@ function BusManager({ ownerId, routes, onBusesChanged }: {
                     key={k}
                     onClick={() => setLayout(k)}
                     className={`border rounded-lg p-2 text-left text-xs transition-all ${
-                      layout === k ? 'border-emerald-500 bg-emerald-100' : 'border-gray-200 hover:bg-gray-50'
+                      layout === k ? 'border-blue-500 bg-blue-100' : 'border-gray-200 hover:bg-gray-50'
                     }`}
                   >
                     <p className="font-semibold">{layoutMeta[k].label}</p>
@@ -2637,7 +3087,7 @@ function BusManager({ ownerId, routes, onBusesChanged }: {
             {error && (
               <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded p-2">{error}</div>
             )}
-            <Button onClick={handleCreate} disabled={loading} className="bg-emerald-600 hover:bg-emerald-700">
+            <Button onClick={handleCreate} disabled={loading} className="bg-blue-600 hover:bg-blue-700">
               {loading ? 'Creating...' : `Add ${layoutMeta[layout].label}`}
             </Button>
           </div>
@@ -2648,13 +3098,13 @@ function BusManager({ ownerId, routes, onBusesChanged }: {
         ) : (
           <div className="space-y-2 max-h-64 overflow-y-auto custom-scrollbar">
             {buses.map(b => (
-              <div key={b.id} className="border rounded-lg p-3 hover:bg-emerald-50/30">
+              <div key={b.id} className="border rounded-lg p-3 hover:bg-blue-50/30">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <p className="font-semibold text-sm">{b.name}</p>
                       <Badge variant="outline" className="text-[10px]">{b.registrationNumber}</Badge>
-                      <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 text-[10px]">
+                      <Badge variant="default" className="bg-blue-100 text-blue-700 border-blue-300 text-[10px]">
                         {(layoutMeta as any)[b.layoutType]?.label || b.layoutType} • {b.totalSeats}p
                       </Badge>
                     </div>
@@ -2820,7 +3270,7 @@ function OwnerPanel({
     <div className="space-y-6">
       {/* SACCO Identity Banner */}
       {ownerData?.sacco && (
-        <Card className="bg-gradient-to-r from-emerald-700 to-teal-700 text-white border-none">
+        <Card className="bg-gradient-to-r from-blue-700 to-teal-700 text-white border-none">
           <CardContent className="p-4 flex items-center justify-between flex-wrap gap-2">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
@@ -2828,7 +3278,7 @@ function OwnerPanel({
               </div>
               <div>
                 <p className="font-bold text-lg">{ownerData.sacco.name}</p>
-                <p className="text-xs text-emerald-100">
+                <p className="text-xs text-blue-100">
                   {ownerData.sacco.code ? `Code: ${ownerData.sacco.code} • ` : ''}
                   Region: {ownerData.sacco.region} • Owner: {ownerData.owner.name}
                 </p>
@@ -2837,19 +3287,19 @@ function OwnerPanel({
             <div className="flex gap-2 text-center">
               <div className="bg-white/15 px-3 py-1.5 rounded">
                 <p className="text-lg font-bold leading-none">{ownerData.analytics?.totalBuses ?? 0}</p>
-                <p className="text-[10px] text-emerald-100">Buses</p>
+                <p className="text-[10px] text-blue-100">Buses</p>
               </div>
               <div className="bg-white/15 px-3 py-1.5 rounded">
                 <p className="text-lg font-bold leading-none">{ownerData.analytics?.totalRoutes ?? 0}</p>
-                <p className="text-[10px] text-emerald-100">Routes</p>
+                <p className="text-[10px] text-blue-100">Routes</p>
               </div>
               <div className="bg-white/15 px-3 py-1.5 rounded">
                 <p className="text-lg font-bold leading-none">{ownerData.analytics?.totalPassengersAllTime ?? 0}</p>
-                <p className="text-[10px] text-emerald-100">Passengers</p>
+                <p className="text-[10px] text-blue-100">Passengers</p>
               </div>
               <div className="bg-white/15 px-3 py-1.5 rounded">
                 <p className="text-lg font-bold leading-none">KES {(ownerData.analytics?.totalRevenueAllTime ?? 0).toLocaleString()}</p>
-                <p className="text-[10px] text-emerald-100">All-time Rev</p>
+                <p className="text-[10px] text-blue-100">All-time Rev</p>
               </div>
             </div>
           </CardContent>
@@ -2859,10 +3309,10 @@ function OwnerPanel({
       {/* Fleet Overview Stats */}
       {fleetData?.stats && (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
-          <Card className="bg-gradient-to-br from-emerald-500 to-emerald-700 text-white">
+          <Card className="bg-gradient-to-br from-blue-500 to-blue-700 text-white">
             <CardContent className="p-3 text-center">
               <p className="text-xl font-bold">{fleetData.stats.totalBuses}</p>
-              <p className="text-[10px] text-emerald-100">Total Buses</p>
+              <p className="text-[10px] text-blue-100">Total Buses</p>
             </CardContent>
           </Card>
           <Card className="bg-gradient-to-br from-teal-500 to-teal-700 text-white">
@@ -2904,7 +3354,7 @@ function OwnerPanel({
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
               <CardTitle className="text-lg flex items-center gap-2">
-                <Bus className="w-5 h-5 text-emerald-600" />
+                <Bus className="w-5 h-5 text-blue-600" />
                 Fleet Status
               </CardTitle>
               <Badge variant="outline" className="text-xs">
@@ -2919,23 +3369,23 @@ function OwnerPanel({
                   key={bus.id}
                   className={`flex items-center gap-3 p-3 rounded-lg border ${
                     bus.isOffRoute ? 'border-red-300 bg-red-50' :
-                    bus.isTracking ? 'border-emerald-200 bg-emerald-50/40' :
+                    bus.isTracking ? 'border-blue-200 bg-blue-50/40' :
                     'border-gray-200 bg-gray-50'
                   }`}
                 >
                   <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${
                     bus.isOffRoute ? 'bg-red-100' :
-                    bus.speed > 0 ? 'bg-emerald-100' : 'bg-gray-200'
+                    bus.speed > 0 ? 'bg-blue-100' : 'bg-gray-200'
                   }`}>
-                    <Bus className={`w-5 h-5 ${bus.isOffRoute ? 'text-red-600' : bus.speed > 0 ? 'text-emerald-600' : 'text-gray-500'}`} />
+                    <Bus className={`w-5 h-5 ${bus.isOffRoute ? 'text-red-600' : bus.speed > 0 ? 'text-blue-600' : 'text-gray-500'}`} />
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <p className="font-semibold text-sm">{bus.registrationNumber}</p>
                       <Badge variant="outline" className="text-[10px]">{bus.name}</Badge>
                       {bus.isTracking && (
-                        <Badge className="text-[10px] bg-emerald-100 text-emerald-700 border-emerald-300">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1" />
+                        <Badge className="text-[10px] bg-blue-100 text-blue-700 border-blue-300">
+                          <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse mr-1" />
                           LIVE
                         </Badge>
                       )}
@@ -2947,7 +3397,7 @@ function OwnerPanel({
                       {bus.routeName || 'No route assigned'} • {bus.saccoName}
                     </p>
                     {bus.intelligence && (
-                      <p className="text-xs text-emerald-600 mt-0.5">
+                      <p className="text-xs text-blue-600 mt-0.5">
                         {bus.intelligence.atStopName
                           ? `📍 At ${bus.intelligence.atStopName}`
                           : bus.intelligence.etaToNextStop
@@ -2960,10 +3410,10 @@ function OwnerPanel({
                     )}
                   </div>
                   <div className="text-right shrink-0">
-                    <p className="text-sm font-bold text-emerald-700">{bus.speed || 0}</p>
+                    <p className="text-sm font-bold text-blue-700">{bus.speed || 0}</p>
                     <p className="text-[10px] text-gray-400">km/h</p>
                     {bus.totalRevenue > 0 && (
-                      <p className="text-xs text-emerald-600 mt-1">KES {bus.totalRevenue}</p>
+                      <p className="text-xs text-blue-600 mt-1">KES {bus.totalRevenue}</p>
                     )}
                   </div>
                 </div>
@@ -2976,17 +3426,17 @@ function OwnerPanel({
       {/* GPS Intelligence Bar */}
       {gpsData && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          <Card className="bg-emerald-50/50 border-emerald-200">
+          <Card className="bg-blue-50/50 border-blue-200">
             <CardContent className="p-3">
-              <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Route Progress</p>
-              <p className="text-lg font-bold text-emerald-800">{gpsData.routeProgressPercent ?? 0}%</p>
+              <p className="text-[10px] text-blue-600 uppercase tracking-wide">Route Progress</p>
+              <p className="text-lg font-bold text-blue-800">{gpsData.routeProgressPercent ?? 0}%</p>
               <Progress value={gpsData.routeProgressPercent ?? 0} className="h-1.5 mt-1" />
             </CardContent>
           </Card>
-          <Card className={`border ${gpsData.isOffRoute ? 'bg-red-50 border-red-300' : 'bg-emerald-50/50 border-emerald-200'}`}>
+          <Card className={`border ${gpsData.isOffRoute ? 'bg-red-50 border-red-300' : 'bg-blue-50/50 border-blue-200'}`}>
             <CardContent className="p-3">
-              <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Off-Route Status</p>
-              <p className={`text-lg font-bold ${gpsData.isOffRoute ? 'text-red-700' : 'text-emerald-700'}`}>
+              <p className="text-[10px] text-blue-600 uppercase tracking-wide">Off-Route Status</p>
+              <p className={`text-lg font-bold ${gpsData.isOffRoute ? 'text-red-700' : 'text-blue-700'}`}>
                 {gpsData.isOffRoute ? `${gpsData.offRouteDistance || 0}m` : 'On Route'}
               </p>
               <p className="text-[10px] text-gray-500">
@@ -2994,10 +3444,10 @@ function OwnerPanel({
               </p>
             </CardContent>
           </Card>
-          <Card className="bg-emerald-50/50 border-emerald-200">
+          <Card className="bg-blue-50/50 border-blue-200">
             <CardContent className="p-3">
-              <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Geofence</p>
-              <p className="text-lg font-bold text-emerald-800">
+              <p className="text-[10px] text-blue-600 uppercase tracking-wide">Geofence</p>
+              <p className="text-lg font-bold text-blue-800">
                 {gpsData.atStopName ? gpsData.atStopName.split(' ')[0] : 'En route'}
               </p>
               <p className="text-[10px] text-gray-500">
@@ -3007,10 +3457,10 @@ function OwnerPanel({
               </p>
             </CardContent>
           </Card>
-          <Card className="bg-emerald-50/50 border-emerald-200">
+          <Card className="bg-blue-50/50 border-blue-200">
             <CardContent className="p-3">
-              <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Next Stop ETA</p>
-              <p className="text-lg font-bold text-emerald-800">
+              <p className="text-[10px] text-blue-600 uppercase tracking-wide">Next Stop ETA</p>
+              <p className="text-lg font-bold text-blue-800">
                 {gpsData.etas?.find(e => e.order === (currentStopIndex + 2))?.etaMinutes ?? '—'}
                 <span className="text-xs font-normal ml-1">min</span>
               </p>
@@ -3027,7 +3477,7 @@ function OwnerPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <Navigation className="w-5 h-5 text-emerald-600" />
+              <Navigation className="w-5 h-5 text-blue-600" />
               ETA to All Stops
             </CardTitle>
           </CardHeader>
@@ -3040,13 +3490,13 @@ function OwnerPanel({
                   <div
                     key={eta.order}
                     className={`flex items-center gap-3 p-2 rounded text-sm ${
-                      isCurrent ? 'bg-emerald-100 border border-emerald-300' :
+                      isCurrent ? 'bg-blue-100 border border-blue-300' :
                       isPast ? 'opacity-40' : ''
                     }`}
                   >
                     <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
-                      isPast ? 'bg-emerald-500 text-white' :
-                      isCurrent ? 'bg-emerald-600 text-white animate-pulse' :
+                      isPast ? 'bg-blue-500 text-white' :
+                      isCurrent ? 'bg-blue-600 text-white animate-pulse' :
                       'bg-gray-100 text-gray-600'
                     }`}>
                       {eta.order}
@@ -3056,7 +3506,7 @@ function OwnerPanel({
                     </span>
                     <span className="text-xs text-gray-500 shrink-0">{eta.distanceMeters}m</span>
                     <span className={`text-sm font-semibold shrink-0 w-16 text-right ${
-                      eta.etaMinutes === null ? 'text-gray-300' : 'text-emerald-700'
+                      eta.etaMinutes === null ? 'text-gray-300' : 'text-blue-700'
                     }`}>
                       {eta.etaMinutes === null ? '—' : `${eta.etaMinutes}m`}
                     </span>
@@ -3096,10 +3546,10 @@ function OwnerPanel({
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between flex-wrap gap-2">
               <CardTitle className="text-lg flex items-center gap-2">
-                <MapPin className="w-5 h-5 text-emerald-600" />
+                <MapPin className="w-5 h-5 text-blue-600" />
                 Live Fleet Map
-                <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 ml-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1" />
+                <Badge variant="default" className="bg-blue-100 text-blue-700 border-blue-300 ml-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse mr-1" />
                   {fleetData.stats?.tracking ?? 0} of {fleetData.stats?.totalBuses ?? 0} live
                 </Badge>
               </CardTitle>
@@ -3176,7 +3626,7 @@ function OwnerPanel({
                     <span className="text-gray-500">{bus.speed || 0} km/h</span>
                     {bus.isOffRoute && <Badge variant="destructive" className="text-[9px] h-4 px-1">OFF</Badge>}
                     {bus.isTracking && (
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" title="Live tracking" />
+                      <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" title="Live tracking" />
                     )}
                   </div>
                 )
@@ -3192,16 +3642,16 @@ function OwnerPanel({
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between flex-wrap gap-2">
               <CardTitle className="text-lg flex items-center gap-2">
-                <Navigation className="w-5 h-5 text-emerald-600" />
+                <Navigation className="w-5 h-5 text-blue-600" />
                 Selected Bus: {busData.registrationNumber}
-                <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 ml-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1" />
+                <Badge variant="default" className="bg-blue-100 text-blue-700 border-blue-300 ml-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse mr-1" />
                   {gpsData?.speed ? 'Moving' : 'Idle'}
                 </Badge>
               </CardTitle>
               <div className="flex items-center gap-3 text-xs text-gray-500">
-                <span>Bus: <strong className="text-emerald-700">{busData.registrationNumber}</strong></span>
-                <span>Route: <strong className="text-emerald-700">{busData.route?.name || 'No route'}</strong></span>
+                <span>Bus: <strong className="text-blue-700">{busData.registrationNumber}</strong></span>
+                <span>Route: <strong className="text-blue-700">{busData.route?.name || 'No route'}</strong></span>
               </div>
             </div>
           </CardHeader>
@@ -3250,23 +3700,23 @@ function OwnerPanel({
 
             {/* Telemetry strip */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
-              <div className="bg-emerald-50 rounded-lg p-2 text-center border border-emerald-200">
-                <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Speed</p>
-                <p className="font-bold text-emerald-800 text-sm">{gpsData?.speed || 0} <span className="text-[10px] font-normal">km/h</span></p>
+              <div className="bg-blue-50 rounded-lg p-2 text-center border border-blue-200">
+                <p className="text-[10px] text-blue-600 uppercase tracking-wide">Speed</p>
+                <p className="font-bold text-blue-800 text-sm">{gpsData?.speed || 0} <span className="text-[10px] font-normal">km/h</span></p>
               </div>
-              <div className="bg-emerald-50 rounded-lg p-2 text-center border border-emerald-200">
-                <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Heading</p>
-                <p className="font-bold text-emerald-800 text-sm">{gpsData?.heading || 0}°</p>
+              <div className="bg-blue-50 rounded-lg p-2 text-center border border-blue-200">
+                <p className="text-[10px] text-blue-600 uppercase tracking-wide">Heading</p>
+                <p className="font-bold text-blue-800 text-sm">{gpsData?.heading || 0}°</p>
               </div>
-              <div className="bg-emerald-50 rounded-lg p-2 text-center border border-emerald-200">
-                <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Last Ping</p>
-                <p className="font-bold text-emerald-800 text-sm">
+              <div className="bg-blue-50 rounded-lg p-2 text-center border border-blue-200">
+                <p className="text-[10px] text-blue-600 uppercase tracking-wide">Last Ping</p>
+                <p className="font-bold text-blue-800 text-sm">
                   {gpsData?.lastUpdated ? new Date(gpsData.lastUpdated).toLocaleTimeString() : 'N/A'}
                 </p>
               </div>
-              <div className="bg-emerald-50 rounded-lg p-2 text-center border border-emerald-200">
-                <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Trail Points</p>
-                <p className="font-bold text-emerald-800 text-sm">{gpsData?.historyCount || 0}</p>
+              <div className="bg-blue-50 rounded-lg p-2 text-center border border-blue-200">
+                <p className="text-[10px] text-blue-600 uppercase tracking-wide">Trail Points</p>
+                <p className="font-bold text-blue-800 text-sm">{gpsData?.historyCount || 0}</p>
               </div>
             </div>
 
@@ -3283,11 +3733,11 @@ function OwnerPanel({
 
       {/* Revenue Overview Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-        <Card className="bg-gradient-to-br from-emerald-500 to-emerald-700 text-white">
+        <Card className="bg-gradient-to-br from-blue-500 to-blue-700 text-white">
           <CardContent className="p-4">
             <DollarSign className="w-6 h-6 mb-1 opacity-80" />
             <p className="text-2xl font-bold">KES {todayRevenue.toLocaleString()}</p>
-            <p className="text-emerald-200 text-sm">Today&apos;s Revenue</p>
+            <p className="text-blue-200 text-sm">Today&apos;s Revenue</p>
           </CardContent>
         </Card>
         <Card className="bg-gradient-to-br from-teal-500 to-teal-700 text-white">
@@ -3312,7 +3762,7 @@ function OwnerPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <BarChart3 className="w-5 h-5 text-emerald-600" />
+              <BarChart3 className="w-5 h-5 text-blue-600" />
               Revenue by Method
             </CardTitle>
           </CardHeader>
@@ -3341,7 +3791,7 @@ function OwnerPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <PieChartIcon className="w-5 h-5 text-emerald-600" />
+              <PieChartIcon className="w-5 h-5 text-blue-600" />
               Payment Breakdown
             </CardTitle>
           </CardHeader>
@@ -3380,7 +3830,7 @@ function OwnerPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <Armchair className="w-5 h-5 text-emerald-600" />
+              <Armchair className="w-5 h-5 text-blue-600" />
               Seat Occupancy
             </CardTitle>
           </CardHeader>
@@ -3408,7 +3858,7 @@ function OwnerPanel({
                           const seat = seatsByRowCol.get(`${rIdx + 1}-${cIdx + 1}`)
                           if (!seat) return <div key={`${rIdx}-${cIdx}`} />
                           const p = seat.passenger
-                          let bgColor = 'bg-emerald-100 border-emerald-300'
+                          let bgColor = 'bg-blue-100 border-blue-300'
                           if (seat.isOccupied && p) {
                             if (p.paymentStatus === 'unpaid' || p.paymentStatus === 'pending') {
                               bgColor = 'bg-yellow-100 border-yellow-400'
@@ -3441,7 +3891,7 @@ function OwnerPanel({
                   {seats.map(seat => {
                     const isOccupied = occupiedSet.has(seat.number)
                     const p = seat.passenger
-                    let bgColor = 'bg-emerald-100 border-emerald-300'
+                    let bgColor = 'bg-blue-100 border-blue-300'
                     if (isOccupied && p) {
                       if (p.paymentStatus === 'unpaid' || p.paymentStatus === 'pending') {
                         bgColor = 'bg-yellow-100 border-yellow-400'
@@ -3464,7 +3914,7 @@ function OwnerPanel({
               )
             })()}
             <div className="flex gap-3 mt-3 text-xs text-gray-500">
-              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-emerald-100 border border-emerald-300" /> Free</span>
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-100 border border-blue-300" /> Free</span>
               <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-100 border border-red-400" /> Alighting</span>
               <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-orange-100 border border-orange-400" /> Far</span>
               <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-yellow-100 border border-yellow-400" /> Unpaid</span>
@@ -3476,7 +3926,7 @@ function OwnerPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-lg flex items-center gap-2">
-              <MapPin className="w-5 h-5 text-emerald-600" />
+              <MapPin className="w-5 h-5 text-blue-600" />
               Revenue by Stop
             </CardTitle>
           </CardHeader>
@@ -3502,7 +3952,7 @@ function OwnerPanel({
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-lg flex items-center gap-2">
-            <Bus className="w-5 h-5 text-emerald-600" />
+            <Bus className="w-5 h-5 text-blue-600" />
             Active Trip Info
           </CardTitle>
         </CardHeader>
@@ -3518,7 +3968,7 @@ function OwnerPanel({
             </div>
             <div>
               <p className="text-gray-500">Total Fare Collected</p>
-              <p className="font-semibold text-emerald-600">KES {todayRevenue.toLocaleString()}</p>
+              <p className="font-semibold text-blue-600">KES {todayRevenue.toLocaleString()}</p>
             </div>
             <div>
               <p className="text-gray-500">Trip Status</p>
@@ -3532,7 +3982,7 @@ function OwnerPanel({
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-lg flex items-center gap-2">
-            <Clock className="w-5 h-5 text-emerald-600" />
+            <Clock className="w-5 h-5 text-blue-600" />
             Trip Event Log
           </CardTitle>
         </CardHeader>
@@ -3544,10 +3994,10 @@ function OwnerPanel({
               eventLog.map((event, i) => (
                 <div key={i} className="flex items-start gap-3 p-2 rounded bg-gray-50 text-sm">
                   <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${
-                    event.type === 'boarded' ? 'bg-emerald-100' : 'bg-blue-100'
+                    event.type === 'boarded' ? 'bg-blue-100' : 'bg-blue-100'
                   }`}>
                     {event.type === 'boarded' ? (
-                      <User className="w-4 h-4 text-emerald-600" />
+                      <User className="w-4 h-4 text-blue-600" />
                     ) : (
                       <ArrowRight className="w-4 h-4 text-blue-600" />
                     )}

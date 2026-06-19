@@ -29,7 +29,7 @@ export async function POST() {
 
     // Run the seed script in a child process so we don't duplicate logic
     const { stdout, stderr } = await execAsync(
-      "npx tsx prisma/seed.ts",
+      "bun run prisma/seed.ts",
       { cwd: "/home/z/my-project" }
     );
     if (stderr) console.error("[seed stderr]", stderr);
