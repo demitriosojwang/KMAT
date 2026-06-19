@@ -26,6 +26,15 @@ model Bus {
   seats            Seat[]
   trips            Trip[]
   route            Route?
+  gpsHistory       GPSHistory[]
+  // Live state (last known)
+  lastLat          Float?
+  lastLng          Float?
+  lastSpeed        Float?   @default(0)
+  lastHeading      Float?   @default(0)
+  lastGpsAt        DateTime?
+  isTracking       Boolean  @default(false)
+  isOffRoute       Boolean  @default(false)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 }
@@ -130,4 +139,22 @@ model Owner {
   sacco     SACCO    @relation(fields: [saccoId], references: [id])
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model GPSHistory {
+  id        String   @id @default(cuid())
+  busId     String
+  bus       Bus      @relation(fields: [busId], references: [id])
+  lat       Float
+  lng       Float
+  speed     Float    @default(0)
+  heading   Float    @default(0)
+  accuracy  Float?   // GPS accuracy in meters
+  source    String   @default("tablet") // tablet, simulated, manual
+  isOffRoute Boolean @default(false)
+  offRouteDistance Float? @default(0) // meters from nearest route point
+  createdAt DateTime @default(now())
+
+  @@index([busId, createdAt])
+  @@index([createdAt])
 }

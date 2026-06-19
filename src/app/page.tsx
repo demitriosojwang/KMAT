@@ -116,6 +116,14 @@ interface GPSData {
   heading: number
   lastUpdated: string
   gpsHistory: GPSLocation[]
+  // Phase 2 intelligence
+  atStopIndex?: number
+  atStopName?: string | null
+  isOffRoute?: boolean
+  offRouteDistance?: number
+  offRouteThreshold?: number
+  routeProgressPercent?: number
+  etas?: Array<{ order: number; stopName: string; etaMinutes: number | null; distanceMeters: number }>
 }
 
 // ─── Color helpers ────────────────────────────────────────────────
@@ -190,8 +198,36 @@ export default function Home() {
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [notifications, setNotifications] = useState<WSNotification[]>([])
   const [gpsData, setGpsData] = useState<GPSData | null>(null)
+  const [fleetData, setFleetData] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const socketRef = useRef<Socket | null>(null)
+  const busDataRef = useRef<BusData | null>(null)
+  const activeTabRef = useRef<TabType>('passenger')
+  const fetchFleetDataRef = useRef<(() => Promise<void>) | null>(null)
+
+  // ─── Fleet data fetching (for Owner panel) ────────────────────
+  const fetchFleetData = useCallback(async () => {
+    try {
+      const res = await fetch('/api/fleet')
+      const data = await res.json()
+      setFleetData(data)
+    } catch (e) {
+      console.error('Failed to fetch fleet data', e)
+    }
+  }, [])
+
+  // Keep refs in sync for use inside socket callbacks
+  useEffect(() => {
+    busDataRef.current = busData
+  }, [busData])
+
+  useEffect(() => {
+    activeTabRef.current = activeTab
+  }, [activeTab])
+
+  useEffect(() => {
+    fetchFleetDataRef.current = fetchFleetData
+  }, [fetchFleetData])
 
   // ─── Data fetching ────────────────────────────────────────────
   const fetchBusData = useCallback(async () => {
@@ -222,7 +258,9 @@ export default function Home() {
 
   const fetchGpsData = useCallback(async () => {
     try {
-      const res = await fetch('/api/gps')
+      const busId = busDataRef.current?.id
+      const url = busId ? `/api/gps?busId=${encodeURIComponent(busId)}&history=true&limit=20` : '/api/gps'
+      const res = await fetch(url)
       const data = await res.json()
       setGpsData(data)
     } catch (e) {
@@ -315,6 +353,28 @@ export default function Home() {
         lastUpdated: data.timestamp,
         gpsHistory: [...prev.gpsHistory, { lat: data.lat, lng: data.lng, speed: data.speed, heading: data.heading, timestamp: data.timestamp }].slice(-20),
       } : prev)
+      // Also refresh fleet data when GPS updates (for Owner panel)
+      if (activeTabRef.current === 'owner') {
+        fetchFleetDataRef.current?.()
+      }
+    })
+
+    // Geofence events (auto-detect stop arrival/departure)
+    socket.on('geofence_event', (data: { type: string; stopIndex: number; stopName?: string; timestamp: string }) => {
+      if (data.type === 'stop_arrival' && data.stopName) {
+        toast.success(`📍 Arrived at ${data.stopName}`, { description: 'Geofence auto-detected' })
+      }
+    })
+
+    // Off-route alerts
+    socket.on('off_route_alert', (data: { distance?: number; cleared?: boolean; timestamp: string }) => {
+      if (data.cleared) {
+        toast.success('✅ Back on route')
+      } else if (data.distance) {
+        toast.error(`⚠️ Off route — ${Math.round(data.distance)}m from route!`, {
+          description: 'Owner has been notified',
+        })
+      }
     })
 
     return () => {
@@ -401,7 +461,10 @@ export default function Home() {
             {tabs.map(tab => (
               <button
                 key={tab.key}
-                onClick={() => setActiveTab(tab.key)}
+                onClick={() => {
+                  setActiveTab(tab.key)
+                  if (tab.key === 'owner') fetchFleetData()
+                }}
                 className={`flex-1 flex items-center justify-center gap-1.5 py-3 text-sm font-medium transition-all border-b-2 ${
                   activeTab === tab.key
                     ? 'border-emerald-600 text-emerald-700 bg-emerald-50/50'
@@ -486,7 +549,8 @@ export default function Home() {
                 currentStopIndex={currentStopIndex}
                 transactions={transactions}
                 gpsData={gpsData}
-                onRefresh={() => { fetchBusData() }}
+                fleetData={fleetData}
+                onRefresh={() => { fetchBusData(); fetchFleetData() }}
                 onReset={handleReset}
               />
             )}
@@ -674,12 +738,18 @@ function PassengerPanel({
   }
 
   // Compute ETA to passenger's selected alighting stop
+  // Prefer real ETA from /api/gps intelligence; fall back to heuristic
   const etaMinutes = (() => {
-    if (!gpsData?.speed || gpsData.speed < 5) return null
     if (!selectedStopData) return null
+    // Real ETA from server (Haversine + actual speed)
+    if (gpsData?.etas) {
+      const match = gpsData.etas.find(e => e.order === selectedStopData.order)
+      if (match && match.etaMinutes !== null) return match.etaMinutes
+    }
+    // Fallback: heuristic
+    if (!gpsData?.speed || gpsData.speed < 5) return null
     const stopsToGo = selectedStopData.order - (currentStopIndex + 1)
     if (stopsToGo <= 0) return 0
-    // ~3 minutes per stop on average
     return Math.max(1, Math.round(stopsToGo * 3 - (stopsToGo * 3 * 0.2)))
   })()
 
@@ -690,6 +760,27 @@ function PassengerPanel({
         <h2 className="text-2xl font-bold text-emerald-800">Welcome aboard! 🚌</h2>
         <p className="text-gray-500 mt-1">Select your seat and destination</p>
       </div>
+
+      {/* Off-route alert banner */}
+      {gpsData?.isOffRoute && (
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-red-50 border-2 border-red-300 rounded-lg p-3 flex items-center gap-3"
+        >
+          <div className="w-8 h-8 rounded-full bg-red-100 flex items-center justify-center shrink-0">
+            <Navigation className="w-4 h-4 text-red-600" />
+          </div>
+          <div className="flex-1">
+            <p className="text-sm font-semibold text-red-700">
+              Bus is currently off-route
+            </p>
+            <p className="text-xs text-red-500">
+              {gpsData.offRouteDistance || 0}m from scheduled route — your trip may take longer than expected
+            </p>
+          </div>
+        </motion.div>
+      )}
 
       {/* Mini Live Bus Tracker */}
       <Card className="border-emerald-200 bg-gradient-to-br from-emerald-50 to-teal-50">
@@ -718,6 +809,16 @@ function PassengerPanel({
               <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-white border border-emerald-200">
                 <span className="text-emerald-600 font-bold">{gpsData.speed}</span>
                 <span className="text-gray-500">km/h</span>
+              </span>
+            )}
+            {gpsData?.routeProgressPercent !== undefined && (
+              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-emerald-100 border border-emerald-300 text-emerald-700 font-medium">
+                {gpsData.routeProgressPercent}% route
+              </span>
+            )}
+            {gpsData?.atStopName && (
+              <span className="flex items-center gap-1 px-2 py-1 rounded-full bg-blue-100 border border-blue-300 text-blue-700 font-medium">
+                📍 At {gpsData.atStopName}
               </span>
             )}
             {gpsData?.currentLocation && (
@@ -1678,18 +1779,25 @@ function DriverPanel({
 
   const sendGpsUpdate = useCallback(async (lat: number, lng: number, speed: number, heading: number) => {
     try {
-      await fetch('/api/gps', {
+      const res = await fetch('/api/gps', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lat, lng, speed, heading, busId: busData?.id || 'demo-bus' }),
+        body: JSON.stringify({ lat, lng, speed, heading, busId: busData?.id || 'demo-bus', source: 'tablet' }),
       })
+      const result = await res.json()
+
       if (busData?.id) {
+        // Include geofence + off-route intelligence in the WS broadcast
         emitSocket('gps_update', {
           busId: busData.id,
           lat,
           lng,
           speed,
           heading,
+          atStopIndex: result?.intelligence?.atStopIndex ?? -1,
+          atStopName: result?.intelligence?.atStopName ?? null,
+          isOffRoute: result?.intelligence?.isOffRoute ?? false,
+          offRouteDistance: result?.intelligence?.offRouteDistance ?? 0,
         })
       }
       fetchGpsData()
@@ -1972,6 +2080,7 @@ function OwnerPanel({
   currentStopIndex,
   transactions,
   gpsData,
+  fleetData,
   onRefresh,
   onReset,
 }: {
@@ -1982,6 +2091,7 @@ function OwnerPanel({
   currentStopIndex: number
   transactions: Transaction[]
   gpsData: GPSData | null
+  fleetData: any
   onRefresh: () => void
   onReset: () => void
 }) {
@@ -2087,6 +2197,218 @@ function OwnerPanel({
 
   return (
     <div className="space-y-6">
+      {/* Fleet Overview Stats */}
+      {fleetData?.stats && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
+          <Card className="bg-gradient-to-br from-emerald-500 to-emerald-700 text-white">
+            <CardContent className="p-3 text-center">
+              <p className="text-xl font-bold">{fleetData.stats.totalBuses}</p>
+              <p className="text-[10px] text-emerald-100">Total Buses</p>
+            </CardContent>
+          </Card>
+          <Card className="bg-gradient-to-br from-teal-500 to-teal-700 text-white">
+            <CardContent className="p-3 text-center">
+              <p className="text-xl font-bold">{fleetData.stats.tracking}</p>
+              <p className="text-[10px] text-teal-100">Tracking</p>
+            </CardContent>
+          </Card>
+          <Card className="bg-gradient-to-br from-cyan-500 to-cyan-700 text-white">
+            <CardContent className="p-3 text-center">
+              <p className="text-xl font-bold">{fleetData.stats.moving}</p>
+              <p className="text-[10px] text-cyan-100">Moving</p>
+            </CardContent>
+          </Card>
+          <Card className="bg-gradient-to-br from-amber-500 to-amber-700 text-white">
+            <CardContent className="p-3 text-center">
+              <p className="text-xl font-bold">{fleetData.stats.idle}</p>
+              <p className="text-[10px] text-amber-100">Idle</p>
+            </CardContent>
+          </Card>
+          <Card className={`bg-gradient-to-br ${fleetData.stats.offRoute > 0 ? 'from-red-500 to-red-700' : 'from-gray-500 to-gray-700'} text-white`}>
+            <CardContent className="p-3 text-center">
+              <p className="text-xl font-bold">{fleetData.stats.offRoute}</p>
+              <p className="text-[10px] text-white/80">Off Route</p>
+            </CardContent>
+          </Card>
+          <Card className="bg-gradient-to-br from-violet-500 to-violet-700 text-white">
+            <CardContent className="p-3 text-center">
+              <p className="text-xl font-bold">{fleetData.stats.totalPassengers}</p>
+              <p className="text-[10px] text-violet-100">Passengers</p>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* Fleet Bus List */}
+      {fleetData?.fleet?.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-lg flex items-center gap-2">
+                <Bus className="w-5 h-5 text-emerald-600" />
+                Fleet Status
+              </CardTitle>
+              <Badge variant="outline" className="text-xs">
+                {fleetData.fleet.filter((b: any) => b.isTracking).length} of {fleetData.fleet.length} live
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2 max-h-64 overflow-y-auto custom-scrollbar">
+              {fleetData.fleet.map((bus: any) => (
+                <div
+                  key={bus.id}
+                  className={`flex items-center gap-3 p-3 rounded-lg border ${
+                    bus.isOffRoute ? 'border-red-300 bg-red-50' :
+                    bus.isTracking ? 'border-emerald-200 bg-emerald-50/40' :
+                    'border-gray-200 bg-gray-50'
+                  }`}
+                >
+                  <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${
+                    bus.isOffRoute ? 'bg-red-100' :
+                    bus.speed > 0 ? 'bg-emerald-100' : 'bg-gray-200'
+                  }`}>
+                    <Bus className={`w-5 h-5 ${bus.isOffRoute ? 'text-red-600' : bus.speed > 0 ? 'text-emerald-600' : 'text-gray-500'}`} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="font-semibold text-sm">{bus.registrationNumber}</p>
+                      <Badge variant="outline" className="text-[10px]">{bus.name}</Badge>
+                      {bus.isTracking && (
+                        <Badge className="text-[10px] bg-emerald-100 text-emerald-700 border-emerald-300">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1" />
+                          LIVE
+                        </Badge>
+                      )}
+                      {bus.isOffRoute && (
+                        <Badge variant="destructive" className="text-[10px]">OFF ROUTE</Badge>
+                      )}
+                    </div>
+                    <p className="text-xs text-gray-500 mt-0.5 truncate">
+                      {bus.routeName || 'No route assigned'} • {bus.saccoName}
+                    </p>
+                    {bus.intelligence && (
+                      <p className="text-xs text-emerald-600 mt-0.5">
+                        {bus.intelligence.atStopName
+                          ? `📍 At ${bus.intelligence.atStopName}`
+                          : bus.intelligence.etaToNextStop
+                          ? `→ ETA next stop: ${bus.intelligence.etaToNextStop} min`
+                          : 'En route'}
+                        {bus.intelligence.offRouteDistance > 0 && bus.isOffRoute && (
+                          <span className="text-red-600 ml-2">({bus.intelligence.offRouteDistance}m off)</span>
+                        )}
+                      </p>
+                    )}
+                  </div>
+                  <div className="text-right shrink-0">
+                    <p className="text-sm font-bold text-emerald-700">{bus.speed || 0}</p>
+                    <p className="text-[10px] text-gray-400">km/h</p>
+                    {bus.totalRevenue > 0 && (
+                      <p className="text-xs text-emerald-600 mt-1">KES {bus.totalRevenue}</p>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* GPS Intelligence Bar */}
+      {gpsData && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <Card className="bg-emerald-50/50 border-emerald-200">
+            <CardContent className="p-3">
+              <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Route Progress</p>
+              <p className="text-lg font-bold text-emerald-800">{gpsData.routeProgressPercent ?? 0}%</p>
+              <Progress value={gpsData.routeProgressPercent ?? 0} className="h-1.5 mt-1" />
+            </CardContent>
+          </Card>
+          <Card className={`border ${gpsData.isOffRoute ? 'bg-red-50 border-red-300' : 'bg-emerald-50/50 border-emerald-200'}`}>
+            <CardContent className="p-3">
+              <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Off-Route Status</p>
+              <p className={`text-lg font-bold ${gpsData.isOffRoute ? 'text-red-700' : 'text-emerald-700'}`}>
+                {gpsData.isOffRoute ? `${gpsData.offRouteDistance || 0}m` : 'On Route'}
+              </p>
+              <p className="text-[10px] text-gray-500">
+                Threshold: {gpsData.offRouteThreshold || 200}m
+              </p>
+            </CardContent>
+          </Card>
+          <Card className="bg-emerald-50/50 border-emerald-200">
+            <CardContent className="p-3">
+              <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Geofence</p>
+              <p className="text-lg font-bold text-emerald-800">
+                {gpsData.atStopName ? gpsData.atStopName.split(' ')[0] : 'En route'}
+              </p>
+              <p className="text-[10px] text-gray-500">
+                {gpsData.atStopIndex !== undefined && gpsData.atStopIndex >= 0
+                  ? `Stop #${gpsData.atStopIndex + 1}`
+                  : 'No stop nearby'}
+              </p>
+            </CardContent>
+          </Card>
+          <Card className="bg-emerald-50/50 border-emerald-200">
+            <CardContent className="p-3">
+              <p className="text-[10px] text-emerald-600 uppercase tracking-wide">Next Stop ETA</p>
+              <p className="text-lg font-bold text-emerald-800">
+                {gpsData.etas?.find(e => e.order === (currentStopIndex + 2))?.etaMinutes ?? '—'}
+                <span className="text-xs font-normal ml-1">min</span>
+              </p>
+              <p className="text-[10px] text-gray-500 truncate">
+                {stops[currentStopIndex + 1]?.name || 'Final stop'}
+              </p>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* ETA Table */}
+      {gpsData?.etas && gpsData.etas.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-lg flex items-center gap-2">
+              <Navigation className="w-5 h-5 text-emerald-600" />
+              ETA to All Stops
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-1 max-h-60 overflow-y-auto custom-scrollbar">
+              {gpsData.etas.map(eta => {
+                const isPast = eta.order < currentStopIndex + 1
+                const isCurrent = eta.order === currentStopIndex + 1
+                return (
+                  <div
+                    key={eta.order}
+                    className={`flex items-center gap-3 p-2 rounded text-sm ${
+                      isCurrent ? 'bg-emerald-100 border border-emerald-300' :
+                      isPast ? 'opacity-40' : ''
+                    }`}
+                  >
+                    <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
+                      isPast ? 'bg-emerald-500 text-white' :
+                      isCurrent ? 'bg-emerald-600 text-white animate-pulse' :
+                      'bg-gray-100 text-gray-600'
+                    }`}>
+                      {eta.order}
+                    </div>
+                    <span className={`flex-1 truncate ${isCurrent ? 'font-bold' : ''}`}>
+                      {eta.stopName}
+                    </span>
+                    <span className="text-xs text-gray-500 shrink-0">{eta.distanceMeters}m</span>
+                    <span className={`text-sm font-semibold shrink-0 w-16 text-right ${
+                      eta.etaMinutes === null ? 'text-gray-300' : 'text-emerald-700'
+                    }`}>
+                      {eta.etaMinutes === null ? '—' : `${eta.etaMinutes}m`}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Live Bus Tracking Map */}
       {typeof window !== 'undefined' && leafletReady && (
         <Card>

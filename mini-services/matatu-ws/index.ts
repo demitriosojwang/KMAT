@@ -35,6 +35,13 @@ const busState: Record<string, {
   }>;
 }> = {};
 
+// Geofence tracking — remembers which stop the bus was last at, so we can
+// emit arrival/departure events instead of spamming "at stop X" every ping.
+const geofenceState: Record<string, {
+  lastAtStopIndex: number; // -1 if not at any stop
+  wasOffRoute: boolean;
+}> = {};
+
 function getBusState(busId: string) {
   if (!busState[busId]) {
     busState[busId] = {
@@ -44,6 +51,13 @@ function getBusState(busId: string) {
     };
   }
   return busState[busId];
+}
+
+function getGeofenceState(busId: string) {
+  if (!geofenceState[busId]) {
+    geofenceState[busId] = { lastAtStopIndex: -1, wasOffRoute: false };
+  }
+  return geofenceState[busId];
 }
 
 io.on("connection", (socket) => {
@@ -245,10 +259,20 @@ io.on("connection", (socket) => {
     }
   );
 
-  // GPS location update
+  // GPS location update — now with geofence + off-route intelligence
   socket.on(
     "gps_update",
-    (data: { busId: string; lat: number; lng: number; speed: number; heading: number }) => {
+    (data: {
+      busId: string;
+      lat: number;
+      lng: number;
+      speed: number;
+      heading: number;
+      atStopIndex?: number;    // sent by client (computed from /api/gps response)
+      atStopName?: string;
+      isOffRoute?: boolean;
+      offRouteDistance?: number;
+    }) => {
       const gpsPoint = {
         lat: data.lat,
         lng: data.lng,
@@ -256,7 +280,83 @@ io.on("connection", (socket) => {
         heading: data.heading,
         timestamp: new Date().toISOString(),
       };
+
+      // Broadcast raw GPS to all clients in the bus room
       io.to(`bus_${data.busId}`).emit("gps_update", gpsPoint);
+
+      // ─── Geofence intelligence ─────────────────────────────────
+      const gf = getGeofenceState(data.busId);
+      const currentStopIdx = data.atStopIndex ?? -1;
+
+      if (currentStopIdx >= 0 && gf.lastAtStopIndex !== currentStopIdx) {
+        // New stop arrival
+        const notif = {
+          id: `notif_geofence_${Date.now()}`,
+          type: "geofence_arrival",
+          message: `📍 Bus arrived at ${data.atStopName || `Stop ${currentStopIdx + 1}`}`,
+          target: "all",
+          timestamp: new Date().toISOString(),
+          read: false,
+        };
+        const state = getBusState(data.busId);
+        state.notifications.unshift(notif);
+        io.to(`bus_${data.busId}`).emit("notification", notif);
+        io.to(`bus_${data.busId}`).emit("geofence_event", {
+          type: "stop_arrival",
+          stopIndex: currentStopIdx,
+          stopName: data.atStopName,
+          timestamp: gpsPoint.timestamp,
+        });
+        gf.lastAtStopIndex = currentStopIdx;
+      } else if (currentStopIdx < 0 && gf.lastAtStopIndex >= 0) {
+        // Departed from last stop
+        io.to(`bus_${data.busId}`).emit("geofence_event", {
+          type: "stop_departure",
+          stopIndex: gf.lastAtStopIndex,
+          timestamp: gpsPoint.timestamp,
+        });
+        gf.lastAtStopIndex = -1;
+      }
+
+      // ─── Off-route alert ───────────────────────────────────────
+      const offRoute = data.isOffRoute ?? false;
+      if (offRoute && !gf.wasOffRoute) {
+        const notif = {
+          id: `notif_offroute_${Date.now()}`,
+          type: "off_route_alert",
+          message: `⚠️ Bus is OFF ROUTE — ${Math.round(data.offRouteDistance || 0)}m from route!`,
+          target: "owner",
+          timestamp: new Date().toISOString(),
+          read: false,
+        };
+        const state = getBusState(data.busId);
+        state.notifications.unshift(notif);
+        io.to(`bus_${data.busId}`).emit("notification", notif);
+        io.to(`bus_${data.busId}`).emit("off_route_alert", {
+          distance: data.offRouteDistance,
+          timestamp: gpsPoint.timestamp,
+        });
+        gf.wasOffRoute = true;
+      } else if (!offRoute && gf.wasOffRoute) {
+        // Back on route
+        const notif = {
+          id: `notif_onroute_${Date.now()}`,
+          type: "back_on_route",
+          message: `✅ Bus is back on route`,
+          target: "owner",
+          timestamp: new Date().toISOString(),
+          read: false,
+        };
+        const state = getBusState(data.busId);
+        state.notifications.unshift(notif);
+        io.to(`bus_${data.busId}`).emit("notification", notif);
+        io.to(`bus_${data.busId}`).emit("off_route_alert", {
+          distance: 0,
+          cleared: true,
+          timestamp: gpsPoint.timestamp,
+        });
+        gf.wasOffRoute = false;
+      }
     }
   );
 
@@ -266,3 +366,5 @@ io.on("connection", (socket) => {
 });
 
 console.log(`[MatatuLink WS] WebSocket server running on port ${PORT}`);
+console.log(`[MatatuLink WS] Geofence + off-route intelligence enabled`);
+
