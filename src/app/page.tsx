@@ -13,16 +13,20 @@ import {
   MessageSquare, Send, RotateCcw,
   TrendingUp, PieChart as PieChartIcon, Activity,
   User, ArrowRight, Radio, Bell as BellIcon,
+  Plus, Route as RouteIcon, Trash2, Building2,
 } from 'lucide-react'
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
+import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Progress } from '@/components/ui/progress'
 import { Separator } from '@/components/ui/separator'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip,
   ResponsiveContainer, PieChart, Pie, Cell
@@ -35,6 +39,9 @@ interface Stop {
   order: number
   isStage: boolean
   routeId: string
+  lat?: number | null
+  lng?: number | null
+  fareFromOrigin?: number | null
 }
 
 interface Passenger {
@@ -56,19 +63,24 @@ interface Passenger {
 interface Seat {
   id: string
   number: number
+  row?: number
+  col?: number
   isOccupied: boolean
   passenger: Passenger | null
   busId: string
 }
+
+type BusLayoutType = 'matatu_14' | 'coaster_33' | 'van_11'
 
 interface BusData {
   id: string
   name: string
   registrationNumber: string
   totalSeats: number
-  route: { id: string; name: string; stops: Stop[] } | null
+  layoutType?: BusLayoutType
+  route: { id: string; name: string; code?: string | null; stops: Stop[] } | null
   seats: Seat[]
-  sacco: { id: string; name: string }
+  sacco: { id: string; name: string; region?: string; code?: string | null }
 }
 
 interface TripData {
@@ -116,6 +128,7 @@ interface GPSData {
   heading: number
   lastUpdated: string
   gpsHistory: GPSLocation[]
+  historyCount?: number
   // Phase 2 intelligence
   atStopIndex?: number
   atStopName?: string | null
@@ -205,16 +218,29 @@ export default function Home() {
   const activeTabRef = useRef<TabType>('passenger')
   const fetchFleetDataRef = useRef<(() => Promise<void>) | null>(null)
 
+  // ─── Multi-SACCO state ──────────────────────────────────────────
+  // For demo, the user can switch between owners (in production this
+  // would be driven by login). Each owner belongs to exactly one SACCO
+  // and only ever sees their own SACCO's buses/routes.
+  const [ownerId, setOwnerId] = useState<string | null>(null)
+  const [ownerList, setOwnerList] = useState<Array<{ id: string; name: string; saccoName: string; region: string }>>([])
+  const [ownerMeta, setOwnerMeta] = useState<{ saccoName: string; region: string } | null>(null)
+
+  // ─── Active bus selector (Conductor/Driver/Passenger operate one bus) ─
+  const [busList, setBusList] = useState<Array<{ id: string; name: string; registrationNumber: string; totalSeats: number; layoutType?: string; routeName?: string | null; routeCode?: string | null }>>([])
+  const [selectedBusId, setSelectedBusId] = useState<string | null>(null)
+
   // ─── Fleet data fetching (for Owner panel) ────────────────────
   const fetchFleetData = useCallback(async () => {
     try {
-      const res = await fetch('/api/fleet')
+      const qs = ownerId ? `?ownerId=${encodeURIComponent(ownerId)}` : ''
+      const res = await fetch(`/api/fleet${qs}`)
       const data = await res.json()
       setFleetData(data)
     } catch (e) {
       console.error('Failed to fetch fleet data', e)
     }
-  }, [])
+  }, [ownerId])
 
   // Keep refs in sync for use inside socket callbacks
   useEffect(() => {
@@ -232,7 +258,11 @@ export default function Home() {
   // ─── Data fetching ────────────────────────────────────────────
   const fetchBusData = useCallback(async () => {
     try {
-      const res = await fetch('/api/bus')
+      const params = new URLSearchParams()
+      if (ownerId) params.set('ownerId', ownerId)
+      if (selectedBusId) params.set('busId', selectedBusId)
+      const qs = params.toString()
+      const res = await fetch(`/api/bus${qs ? `?${qs}` : ''}`)
       const data = await res.json()
       if (data.bus) setBusData(data.bus)
       if (data.trip) setTripData(data.trip)
@@ -240,7 +270,7 @@ export default function Home() {
     } catch (e) {
       console.error('Failed to fetch bus data', e)
     }
-  }, [])
+  }, [ownerId, selectedBusId])
 
   const fetchOwnerData = useCallback(async () => {
     // Owner data is fetched within OwnerPanel
@@ -259,7 +289,13 @@ export default function Home() {
   const fetchGpsData = useCallback(async () => {
     try {
       const busId = busDataRef.current?.id
-      const url = busId ? `/api/gps?busId=${encodeURIComponent(busId)}&history=true&limit=20` : '/api/gps'
+      const params = new URLSearchParams()
+      if (busId) {
+        params.set('busId', busId)
+        params.set('history', 'true')
+        params.set('limit', '20')
+      }
+      const url = `/api/gps${params.toString() ? `?${params}` : ''}`
       const res = await fetch(url)
       const data = await res.json()
       setGpsData(data)
@@ -277,12 +313,66 @@ export default function Home() {
   useEffect(() => {
     const load = async () => {
       setLoading(true)
+      // Load owners list for the switcher
+      try {
+        const res = await fetch('/api/owners')
+        const data = await res.json()
+        if (data.owners?.length) {
+          setOwnerList(data.owners)
+          // Pick the first owner by default
+          if (!ownerId) setOwnerId(data.owners[0].id)
+        }
+      } catch (e) {
+        console.error('Failed to fetch owners list', e)
+      }
       await fetchBusData()
       await fetchGpsData()
       setLoading(false)
     }
     load()
-  }, [fetchBusData, fetchGpsData])
+  }, [])
+
+  // When ownerId changes, fetch the SACCO's bus list and refresh fleet
+  useEffect(() => {
+    if (!ownerId) return
+    const loadSacco = async () => {
+      try {
+        const res = await fetch(`/api/buses?ownerId=${encodeURIComponent(ownerId)}`)
+        const data = await res.json()
+        if (data.buses) {
+          const simplified = data.buses.map((b: any) => ({
+            id: b.id,
+            name: b.name,
+            registrationNumber: b.registrationNumber,
+            totalSeats: b.totalSeats,
+            layoutType: b.layoutType,
+            routeName: b.route?.name ?? null,
+            routeCode: b.route?.code ?? null,
+          }))
+          setBusList(simplified)
+          // If currently-selected bus isn't in this SACCO, switch to first
+          if (!selectedBusId || !simplified.find((b: any) => b.id === selectedBusId)) {
+            setSelectedBusId(simplified[0]?.id ?? null)
+          }
+          setOwnerMeta({ saccoName: data.sacco.name, region: data.sacco.region })
+        }
+      } catch (e) {
+        console.error('Failed to fetch buses for SACCO', e)
+      }
+    }
+    loadSacco()
+  }, [ownerId])
+
+  // When selectedBusId changes (or ownerId), refetch bus/trip/gps data
+  useEffect(() => {
+    if (selectedBusId) {
+      fetchBusData().then(() => fetchGpsData())
+      // Also re-join the new bus's WS room
+      if (socketRef.current?.connected) {
+        socketRef.current.emit('join_bus', selectedBusId)
+      }
+    }
+  }, [selectedBusId, ownerId, fetchBusData, fetchGpsData])
 
   // ─── WebSocket ────────────────────────────────────────────────
   useEffect(() => {
@@ -437,7 +527,7 @@ export default function Home() {
     <div className="min-h-screen flex flex-col bg-gradient-to-b from-emerald-50/80 to-white">
       {/* ─── Header ─────────────────────────────────────────────── */}
       <header className="sticky top-0 z-50 bg-emerald-700 text-white shadow-lg">
-        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-full bg-emerald-500 flex items-center justify-center shadow-md">
               <Bus className="w-5 h-5" />
@@ -447,11 +537,64 @@ export default function Home() {
               <p className="text-emerald-200 text-xs">Kenyan Matatu System</p>
             </div>
           </div>
-          <div className="text-right">
-            <p className="font-semibold text-sm">{busData?.name || 'Loading...'}</p>
-            <p className="text-emerald-200 text-xs">{busData?.registrationNumber} • {busData?.sacco?.name}</p>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            {/* SACCO / Owner switcher (demo auth) */}
+            {ownerList.length > 0 && (
+              <div className="flex flex-col text-right">
+                <label className="text-[10px] text-emerald-200 mb-0.5 flex items-center gap-1 justify-end">
+                  <Building2 className="w-3 h-3" /> SACCO
+                </label>
+                <select
+                  value={ownerId ?? ''}
+                  onChange={(e) => setOwnerId(e.target.value)}
+                  className="bg-emerald-600 text-white text-xs rounded-md px-2 py-1 border border-emerald-400 max-w-[200px]"
+                >
+                  {ownerList.map(o => (
+                    <option key={o.id} value={o.id} className="text-black">
+                      {o.saccoName} — {o.region}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* Bus selector */}
+            {busList.length > 0 && (
+              <div className="flex flex-col text-right">
+                <label className="text-[10px] text-emerald-200 mb-0.5 flex items-center gap-1 justify-end">
+                  <Bus className="w-3 h-3" /> Active Bus
+                </label>
+                <select
+                  value={selectedBusId ?? ''}
+                  onChange={(e) => setSelectedBusId(e.target.value)}
+                  className="bg-emerald-600 text-white text-xs rounded-md px-2 py-1 border border-emerald-400 max-w-[200px]"
+                >
+                  {busList.map(b => (
+                    <option key={b.id} value={b.id} className="text-black">
+                      {b.registrationNumber} ({b.totalSeats}p)
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
         </div>
+
+        {/* Secondary bar: route + active bus summary */}
+        {busData && (
+          <div className="bg-emerald-800/50 border-t border-emerald-600">
+            <div className="max-w-5xl mx-auto px-4 py-1.5 flex items-center justify-between text-xs text-emerald-100 flex-wrap gap-1">
+              <span className="flex items-center gap-1.5">
+                <RouteIcon className="w-3 h-3" />
+                {busData.route?.code ? `Route ${busData.route.code}` : 'No code'} • {busData.route?.name || 'No route assigned'}
+              </span>
+              <span>
+                {busData.registrationNumber} • {busData.totalSeats} seats ({busData.layoutType?.replace('_', ' ')})
+              </span>
+            </div>
+          </div>
+        )}
       </header>
 
       {/* ─── Tab Bar ────────────────────────────────────────────── */}
@@ -550,6 +693,7 @@ export default function Home() {
                 transactions={transactions}
                 gpsData={gpsData}
                 fleetData={fleetData}
+                ownerId={ownerId}
                 onRefresh={() => { fetchBusData(); fetchFleetData() }}
                 onReset={handleReset}
               />
@@ -1400,88 +1544,178 @@ function ConductorPanel({
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-4 sm:grid-cols-7 gap-2">
-              {seats.map(seat => {
-                const color = getSeatColor(seat, currentStopIndex)
-                const isClickable = seat.isOccupied
+            {/* Layout-aware seat grid: uses row/col when available so the
+                33-seater Coaster renders correctly with its aisle. */}
+            {(() => {
+              // If all seats have row/col, render as absolute-positioned grid by row/col
+              const hasLayout = seats.every(s => s.row !== undefined && s.col !== undefined)
+              if (hasLayout) {
+                const maxRow = Math.max(...seats.map(s => s.row as number))
+                const maxCol = Math.max(...seats.map(s => s.col as number))
+                const seatsByRowCol = new Map<string, Seat>()
+                seats.forEach(s => seatsByRowCol.set(`${s.row}-${s.col}`, s))
                 return (
-                  <Dialog key={seat.id}>
-                    <DialogTrigger asChild>
-                      <button
-                        className={`p-2 rounded-lg border-2 text-center transition-all text-xs font-medium ${color} ${
-                          isClickable ? 'cursor-pointer hover:shadow-md' : ''
-                        }`}
-                        onClick={() => isClickable && setSelectedSeatDialog(seat)}
-                      >
-                        <Armchair className="w-3 h-3 mx-auto mb-0.5" />
-                        <span className="block">{seat.number}</span>
-                        {seat.passenger && (
-                          <span className="block text-[10px] truncate opacity-70">
-                            {seat.passenger.name || '---'}
-                          </span>
-                        )}
-                      </button>
-                    </DialogTrigger>
-                    {isClickable && selectedSeatDialog?.id === seat.id && seat.passenger && (
-                      <DialogContent>
-                        <DialogHeader>
-                          <DialogTitle>Seat {seat.number}</DialogTitle>
-                          <DialogDescription>Passenger details</DialogDescription>
-                        </DialogHeader>
-                        <div className="space-y-3">
-                          <div className="grid grid-cols-2 gap-2 text-sm">
-                            <div>
-                              <p className="text-gray-500">Name</p>
-                              <p className="font-medium">{seat.passenger.name || 'Unknown'}</p>
-                            </div>
-                            <div>
-                              <p className="text-gray-500">Phone</p>
-                              <p className="font-medium">{seat.passenger.phone || '—'}</p>
-                            </div>
-                            <div>
-                              <p className="text-gray-500">Boarding</p>
-                              <p className="font-medium">{seat.passenger.boardingStop}</p>
-                            </div>
-                            <div>
-                              <p className="text-gray-500">Alighting</p>
-                              <p className="font-medium">{seat.passenger.alightingStop}</p>
-                            </div>
-                            <div>
-                              <p className="text-gray-500">Fare</p>
-                              <p className="font-medium">KES {seat.passenger.fare}</p>
-                            </div>
-                            <div>
-                              <p className="text-gray-500">Payment</p>
-                              <Badge variant={seat.passenger.paymentStatus === 'paid' ? 'default' : 'destructive'}>
-                                {seat.passenger.paymentStatus}
-                              </Badge>
-                            </div>
-                          </div>
-                          <div className="flex gap-2">
-                            {seat.passenger.paymentStatus !== 'paid' && (
-                              <Button
-                                size="sm"
-                                onClick={() => handleMarkPaid(seat.passenger!.id, seat.passenger!.fare)}
-                                className="bg-emerald-600 hover:bg-emerald-700"
-                              >
-                                Mark Paid
-                              </Button>
-                            )}
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              onClick={() => handleAlight(seat.passenger!.id, seat.number)}
-                            >
-                              Confirm Alight
-                            </Button>
-                          </div>
-                        </div>
-                      </DialogContent>
-                    )}
-                  </Dialog>
+                  <div className="overflow-x-auto">
+                    <div
+                      className="grid gap-1.5 mx-auto"
+                      style={{
+                        gridTemplateColumns: `repeat(${maxCol}, minmax(28px, 36px))`,
+                        gridTemplateRows: `repeat(${maxRow}, minmax(32px, 40px))`,
+                        width: 'fit-content',
+                      }}
+                    >
+                      {Array.from({ length: maxRow }).map((_, rIdx) =>
+                        Array.from({ length: maxCol }).map((__, cIdx) => {
+                          const seat = seatsByRowCol.get(`${rIdx + 1}-${cIdx + 1}`)
+                          if (!seat) return <div key={`${rIdx}-${cIdx}`} />
+                          const color = getSeatColor(seat, currentStopIndex)
+                          const isClickable = seat.isOccupied
+                          return (
+                            <Dialog key={seat.id}>
+                              <DialogTrigger asChild>
+                                <button
+                                  className={`p-1 rounded-lg border-2 text-center transition-all text-xs font-medium ${color} ${
+                                    isClickable ? 'cursor-pointer hover:shadow-md' : ''
+                                  }`}
+                                  onClick={() => isClickable && setSelectedSeatDialog(seat)}
+                                  title={`Seat ${seat.number}`}
+                                >
+                                  <Armchair className="w-3 h-3 mx-auto mb-0.5" />
+                                  <span className="block">{seat.number}</span>
+                                  {seat.passenger && (
+                                    <span className="block text-[8px] truncate opacity-70">
+                                      {seat.passenger.name || '---'}
+                                    </span>
+                                  )}
+                                </button>
+                              </DialogTrigger>
+                              {isClickable && selectedSeatDialog?.id === seat.id && seat.passenger && (
+                                <DialogContent>
+                                  <DialogHeader>
+                                    <DialogTitle>Seat {seat.number}</DialogTitle>
+                                    <DialogDescription>Passenger details</DialogDescription>
+                                  </DialogHeader>
+                                  <div className="space-y-3">
+                                    <div className="grid grid-cols-2 gap-2 text-sm">
+                                      <div>
+                                        <p className="text-gray-500">Name</p>
+                                        <p className="font-medium">{seat.passenger.name || 'Unknown'}</p>
+                                      </div>
+                                      <div>
+                                        <p className="text-gray-500">Phone</p>
+                                        <p className="font-medium">{seat.passenger.phone || '—'}</p>
+                                      </div>
+                                      <div>
+                                        <p className="text-gray-500">Boarding</p>
+                                        <p className="font-medium">{seat.passenger.boardingStop}</p>
+                                      </div>
+                                      <div>
+                                        <p className="text-gray-500">Alighting</p>
+                                        <p className="font-medium">{seat.passenger.alightingStop}</p>
+                                      </div>
+                                      <div>
+                                        <p className="text-gray-500">Fare</p>
+                                        <p className="font-medium">KES {seat.passenger.fare}</p>
+                                      </div>
+                                      <div>
+                                        <p className="text-gray-500">Payment</p>
+                                        <p className="font-medium capitalize">{seat.passenger.paymentStatus}</p>
+                                      </div>
+                                    </div>
+                                    <Button
+                                      className="w-full bg-emerald-600 hover:bg-emerald-700"
+                                      onClick={() => handleAlight(seat.passenger!.id, seat.number)}
+                                    >
+                                      <UserCheck className="w-4 h-4 mr-2" />
+                                      Alight Passenger
+                                    </Button>
+                                  </div>
+                                </DialogContent>
+                              )}
+                            </Dialog>
+                          )
+                        })
+                      )}
+                    </div>
+                    <p className="text-[10px] text-gray-400 text-center mt-2">
+                      {seats.length} seats · {maxRow} rows × {maxCol} cols (with aisle)
+                    </p>
+                  </div>
                 )
-              })}
-            </div>
+              }
+              // Fallback: simple flat grid
+              return (
+                <div className="grid grid-cols-4 sm:grid-cols-7 gap-2">
+                  {seats.map(seat => {
+                    const color = getSeatColor(seat, currentStopIndex)
+                    const isClickable = seat.isOccupied
+                    return (
+                      <Dialog key={seat.id}>
+                        <DialogTrigger asChild>
+                          <button
+                            className={`p-2 rounded-lg border-2 text-center transition-all text-xs font-medium ${color} ${
+                              isClickable ? 'cursor-pointer hover:shadow-md' : ''
+                            }`}
+                            onClick={() => isClickable && setSelectedSeatDialog(seat)}
+                          >
+                            <Armchair className="w-3 h-3 mx-auto mb-0.5" />
+                            <span className="block">{seat.number}</span>
+                            {seat.passenger && (
+                              <span className="block text-[10px] truncate opacity-70">
+                                {seat.passenger.name || '---'}
+                              </span>
+                            )}
+                          </button>
+                        </DialogTrigger>
+                        {isClickable && selectedSeatDialog?.id === seat.id && seat.passenger && (
+                          <DialogContent>
+                            <DialogHeader>
+                              <DialogTitle>Seat {seat.number}</DialogTitle>
+                              <DialogDescription>Passenger details</DialogDescription>
+                            </DialogHeader>
+                            <div className="space-y-3">
+                              <div className="grid grid-cols-2 gap-2 text-sm">
+                                <div>
+                                  <p className="text-gray-500">Name</p>
+                                  <p className="font-medium">{seat.passenger.name || 'Unknown'}</p>
+                                </div>
+                                <div>
+                                  <p className="text-gray-500">Phone</p>
+                                  <p className="font-medium">{seat.passenger.phone || '—'}</p>
+                                </div>
+                                <div>
+                                  <p className="text-gray-500">Boarding</p>
+                                  <p className="font-medium">{seat.passenger.boardingStop}</p>
+                                </div>
+                                <div>
+                                  <p className="text-gray-500">Alighting</p>
+                                  <p className="font-medium">{seat.passenger.alightingStop}</p>
+                                </div>
+                                <div>
+                                  <p className="text-gray-500">Fare</p>
+                                  <p className="font-medium">KES {seat.passenger.fare}</p>
+                                </div>
+                                <div>
+                                  <p className="text-gray-500">Payment</p>
+                                  <p className="font-medium capitalize">{seat.passenger.paymentStatus}</p>
+                                </div>
+                              </div>
+                              <Button
+                                className="w-full bg-emerald-600 hover:bg-emerald-700"
+                                onClick={() => handleAlight(seat.passenger!.id, seat.number)}
+                              >
+                                <UserCheck className="w-4 h-4 mr-2" />
+                                Alight Passenger
+                              </Button>
+                            </div>
+                          </DialogContent>
+                        )}
+                      </Dialog>
+                    )
+                  })}
+                </div>
+              )
+            })()}
           </CardContent>
         </Card>
 
@@ -2070,6 +2304,387 @@ function DriverPanel({
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// ROUTE MANAGER — let each SACCO register their own numbered routes
+// ═══════════════════════════════════════════════════════════════════
+function RouteManager({ ownerId, onRoutesChanged }: { ownerId: string | null; onRoutesChanged: () => void }) {
+  const [routes, setRoutes] = useState<any[]>([])
+  const [loading, setLoading] = useState(false)
+  const [showForm, setShowForm] = useState(false)
+
+  // Form state
+  const [name, setName] = useState('')
+  const [code, setCode] = useState('')
+  const [region, setRegion] = useState('')
+  const [stopsText, setStopsText] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  const fetchRoutes = useCallback(async () => {
+    if (!ownerId) return
+    try {
+      const res = await fetch(`/api/routes?ownerId=${encodeURIComponent(ownerId)}`)
+      const data = await res.json()
+      if (data.routes) setRoutes(data.routes)
+    } catch (e) {
+      console.error('Failed to fetch routes', e)
+    }
+  }, [ownerId])
+
+  useEffect(() => {
+    fetchRoutes()
+  }, [fetchRoutes])
+
+  const parseStops = (text: string): Array<{ name: string; lat: number; lng: number; isStage: boolean; fareFromOrigin: number }> => {
+    // Each non-empty line: "Name, lat, lng, [isStage], [fareFromOrigin]"
+    return text
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(line => {
+        const parts = line.split(',').map(s => s.trim())
+        if (parts.length < 3) throw new Error(`Bad line: "${line}". Use: Name, lat, lng, [isStage], [fare]`)
+        const lat = parseFloat(parts[1])
+        const lng = parseFloat(parts[2])
+        if (Number.isNaN(lat) || Number.isNaN(lng)) throw new Error(`Invalid lat/lng on: "${line}"`)
+        return {
+          name: parts[0],
+          lat,
+          lng,
+          isStage: parts[3] ? parts[3].toLowerCase() === 'true' || parts[3] === '1' : true,
+          fareFromOrigin: parts[4] ? parseFloat(parts[4]) || 0 : 0,
+        }
+      })
+  }
+
+  const handleCreate = async () => {
+    setError(null)
+    if (!ownerId) return
+    if (!name.trim()) { setError('Route name is required'); return }
+    try {
+      const stops = parseStops(stopsText)
+      if (stops.length < 2) { setError('Provide at least 2 stops'); return }
+
+      setLoading(true)
+      const res = await fetch(`/api/routes?ownerId=${encodeURIComponent(ownerId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, code, region: region || undefined, stops }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setError(data.error || 'Failed to create route')
+        setLoading(false)
+        return
+      }
+      toast.success(`Route "${name}" created with ${stops.length} stops`)
+      setName(''); setCode(''); setStopsText('')
+      setShowForm(false)
+      await fetchRoutes()
+      onRoutesChanged()
+    } catch (e: any) {
+      setError(e.message || 'Failed to parse stops')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-lg flex items-center gap-2">
+            <RouteIcon className="w-5 h-5 text-emerald-600" />
+            Route Manager
+            <Badge variant="outline" className="text-xs ml-1">{routes.length} routes</Badge>
+          </CardTitle>
+          <Button
+            size="sm"
+            onClick={() => setShowForm(s => !s)}
+            className="bg-emerald-600 hover:bg-emerald-700"
+          >
+            <Plus className="w-4 h-4 mr-1" />
+            {showForm ? 'Cancel' : 'Register Route'}
+          </Button>
+        </div>
+        <CardDescription>
+          Each SACCO registers its own routes with a Nairobi-style numbered code (e.g. 33, 110, 237) plus stop coordinates. Stops power the geofencing + ETA engine.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {showForm && (
+          <div className="border rounded-lg p-3 bg-emerald-50/40 space-y-2">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <div>
+                <Label className="text-xs">Route Name *</Label>
+                <Input value={name} onChange={e => setName(e.target.value)} placeholder="Umoja → CBD" />
+              </div>
+              <div>
+                <Label className="text-xs">Route Code</Label>
+                <Input value={code} onChange={e => setCode(e.target.value)} placeholder="33" />
+              </div>
+              <div>
+                <Label className="text-xs">Region</Label>
+                <Input value={region} onChange={e => setRegion(e.target.value)} placeholder="Nairobi" />
+              </div>
+            </div>
+            <div>
+              <Label className="text-xs">
+                Stops (one per line): <code className="bg-white px-1 rounded">Name, lat, lng, [isStage], [fare]</code>
+              </Label>
+              <Textarea
+                value={stopsText}
+                onChange={e => setStopsText(e.target.value)}
+                rows={6}
+                placeholder={'Umoja Innercore, -1.2700, 36.8900, true, 0\nUmoja Market, -1.2680, 36.8830, true, 20\nTena, -1.2640, 36.8750, true, 40'}
+                className="font-mono text-xs"
+              />
+            </div>
+            {error && (
+              <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded p-2">{error}</div>
+            )}
+            <Button onClick={handleCreate} disabled={loading} className="bg-emerald-600 hover:bg-emerald-700">
+              {loading ? 'Creating...' : 'Create Route'}
+            </Button>
+          </div>
+        )}
+
+        {routes.length === 0 ? (
+          <p className="text-sm text-gray-400 text-center py-4">No routes registered yet.</p>
+        ) : (
+          <div className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar">
+            {routes.map(r => (
+              <div key={r.id} className="border rounded-lg p-3 hover:bg-emerald-50/30">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="font-semibold text-sm">{r.name}</p>
+                      {r.code && (
+                        <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 text-[10px]">
+                          #{r.code}
+                        </Badge>
+                      )}
+                      <Badge variant="outline" className="text-[10px]">{r.region}</Badge>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      {r.stops?.length || 0} stops • assigned to {r.buses?.length || 0} bus(es)
+                    </p>
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-gray-300 shrink-0" />
+                </div>
+                {r.stops?.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-2">
+                    {r.stops.slice(0, 8).map((s: any) => (
+                      <span key={s.id} className="text-[10px] bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded">
+                        {s.order}. {s.name}
+                      </span>
+                    ))}
+                    {r.stops.length > 8 && (
+                      <span className="text-[10px] text-gray-400 px-1">+{r.stops.length - 8} more</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BUS MANAGER — add new buses with a layout choice (14 / 33 / 11)
+// ═══════════════════════════════════════════════════════════════════
+function BusManager({ ownerId, routes, onBusesChanged }: {
+  ownerId: string | null
+  routes: any[]
+  onBusesChanged: () => void
+}) {
+  const [buses, setBuses] = useState<any[]>([])
+  const [showForm, setShowForm] = useState(false)
+  const [name, setName] = useState('')
+  const [reg, setReg] = useState('')
+  const [layout, setLayout] = useState<'matatu_14' | 'coaster_33' | 'van_11'>('matatu_14')
+  const [routeId, setRouteId] = useState<string>('')
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const fetchBuses = useCallback(async () => {
+    if (!ownerId) return
+    try {
+      const res = await fetch(`/api/buses?ownerId=${encodeURIComponent(ownerId)}`)
+      const data = await res.json()
+      if (data.buses) setBuses(data.buses)
+    } catch (e) {
+      console.error('Failed to fetch buses', e)
+    }
+  }, [ownerId])
+
+  useEffect(() => {
+    fetchBuses()
+  }, [fetchBuses])
+
+  const handleCreate = async () => {
+    setError(null)
+    if (!ownerId) return
+    if (!name.trim() || !reg.trim()) { setError('Name and registration are required'); return }
+    setLoading(true)
+    try {
+      const res = await fetch(`/api/buses?ownerId=${encodeURIComponent(ownerId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, registrationNumber: reg, layoutType: layout, routeId: routeId || undefined }),
+      })
+      const data = await res.json()
+      if (!res.ok) { setError(data.error || 'Failed'); setLoading(false); return }
+      toast.success(`${name} added (${layout.replace('_', ' ')}, ${data.bus.totalSeats} seats)`)
+      setName(''); setReg(''); setRouteId('')
+      setShowForm(false)
+      await fetchBuses()
+      onBusesChanged()
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleAssignRoute = async (busId: string, newRouteId: string) => {
+    if (!ownerId) return
+    try {
+      await fetch(`/api/buses?ownerId=${encodeURIComponent(ownerId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ busId, routeId: newRouteId || null }),
+      })
+      await fetchBuses()
+      onBusesChanged()
+      toast.success('Bus route updated')
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  const layoutMeta: Record<'matatu_14' | 'coaster_33' | 'van_11', { label: string; seats: number; desc: string }> = {
+    matatu_14: { label: '14-seater Matatu', seats: 14, desc: 'Standard Toyota HiAce / Nissan Urvan' },
+    coaster_33: { label: '33-seater Coaster', seats: 33, desc: 'Toyota Coaster — large-capacity bus' },
+    van_11: { label: '11-seater Van', seats: 11, desc: 'Small shuttle van' },
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-lg flex items-center gap-2">
+            <Bus className="w-5 h-5 text-emerald-600" />
+            Bus Fleet Manager
+            <Badge variant="outline" className="text-xs ml-1">{buses.length} buses</Badge>
+          </CardTitle>
+          <Button size="sm" onClick={() => setShowForm(s => !s)} className="bg-emerald-600 hover:bg-emerald-700">
+            <Plus className="w-4 h-4 mr-1" />
+            {showForm ? 'Cancel' : 'Add Bus'}
+          </Button>
+        </div>
+        <CardDescription>
+          Register a new bus — pick a layout (14, 33, or 11 seater), assign a route, and a fresh trip is auto-started. 33-seater coasters auto-generate the full 33-seat grid.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {showForm && (
+          <div className="border rounded-lg p-3 bg-emerald-50/40 space-y-2">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div>
+                <Label className="text-xs">Bus Name *</Label>
+                <Input value={name} onChange={e => setName(e.target.value)} placeholder="Pipeline Coaster" />
+              </div>
+              <div>
+                <Label className="text-xs">Registration Number *</Label>
+                <Input value={reg} onChange={e => setReg(e.target.value)} placeholder="KEE 778M" />
+              </div>
+            </div>
+            <div>
+              <Label className="text-xs">Layout</Label>
+              <div className="grid grid-cols-3 gap-2">
+                {(Object.keys(layoutMeta) as Array<keyof typeof layoutMeta>).map(k => (
+                  <button
+                    key={k}
+                    onClick={() => setLayout(k)}
+                    className={`border rounded-lg p-2 text-left text-xs transition-all ${
+                      layout === k ? 'border-emerald-500 bg-emerald-100' : 'border-gray-200 hover:bg-gray-50'
+                    }`}
+                  >
+                    <p className="font-semibold">{layoutMeta[k].label}</p>
+                    <p className="text-gray-500 mt-0.5">{layoutMeta[k].seats} seats</p>
+                    <p className="text-[10px] text-gray-400 mt-0.5">{layoutMeta[k].desc}</p>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <Label className="text-xs">Assign Route (optional)</Label>
+              <select
+                value={routeId}
+                onChange={e => setRouteId(e.target.value)}
+                className="w-full border rounded-md px-2 py-1.5 text-sm"
+              >
+                <option value="">— No route —</option>
+                {routes.map(r => (
+                  <option key={r.id} value={r.id}>
+                    {r.code ? `#${r.code}` : ''} {r.name} ({r.stops?.length || 0} stops)
+                  </option>
+                ))}
+              </select>
+            </div>
+            {error && (
+              <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded p-2">{error}</div>
+            )}
+            <Button onClick={handleCreate} disabled={loading} className="bg-emerald-600 hover:bg-emerald-700">
+              {loading ? 'Creating...' : `Add ${layoutMeta[layout].label}`}
+            </Button>
+          </div>
+        )}
+
+        {buses.length === 0 ? (
+          <p className="text-sm text-gray-400 text-center py-4">No buses registered yet.</p>
+        ) : (
+          <div className="space-y-2 max-h-64 overflow-y-auto custom-scrollbar">
+            {buses.map(b => (
+              <div key={b.id} className="border rounded-lg p-3 hover:bg-emerald-50/30">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="font-semibold text-sm">{b.name}</p>
+                      <Badge variant="outline" className="text-[10px]">{b.registrationNumber}</Badge>
+                      <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 text-[10px]">
+                        {(layoutMeta as any)[b.layoutType]?.label || b.layoutType} • {b.totalSeats}p
+                      </Badge>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-1">Route: {b.route?.name || 'Unassigned'}</p>
+                  </div>
+                </div>
+                <div className="mt-2">
+                  <select
+                    value={b.routeId || ''}
+                    onChange={e => handleAssignRoute(b.id, e.target.value)}
+                    className="w-full text-xs border rounded px-2 py-1"
+                  >
+                    <option value="">— Reassign Route —</option>
+                    {routes.map(r => (
+                      <option key={r.id} value={r.id}>
+                        {r.code ? `#${r.code}` : ''} {r.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // OWNER PANEL
 // ═══════════════════════════════════════════════════════════════════
 function OwnerPanel({
@@ -2081,6 +2696,7 @@ function OwnerPanel({
   transactions,
   gpsData,
   fleetData,
+  ownerId,
   onRefresh,
   onReset,
 }: {
@@ -2092,6 +2708,7 @@ function OwnerPanel({
   transactions: Transaction[]
   gpsData: GPSData | null
   fleetData: any
+  ownerId: string | null
   onRefresh: () => void
   onReset: () => void
 }) {
@@ -2127,7 +2744,8 @@ function OwnerPanel({
   useEffect(() => {
     const fetchOwner = async () => {
       try {
-        const res = await fetch('/api/owner')
+        const qs = ownerId ? `?ownerId=${encodeURIComponent(ownerId)}` : ''
+        const res = await fetch(`/api/owner${qs}`)
         const data = await res.json()
         setOwnerData(data)
       } catch (e) {
@@ -2135,7 +2753,7 @@ function OwnerPanel({
       }
     }
     fetchOwner()
-  }, [tripData])
+  }, [tripData, ownerId])
 
   const todayRevenue = tripData?.totalRevenue || 0
   const todayPassengers = tripData?.totalPassengers || 0
@@ -2195,8 +2813,49 @@ function OwnerPanel({
   // Mini seat map
   const occupiedSet = new Set(seats.filter(s => s.isOccupied).map(s => s.number))
 
+  // Routes from ownerData (used by BusManager for route assignment)
+  const routes = ownerData?.routes || []
+
   return (
     <div className="space-y-6">
+      {/* SACCO Identity Banner */}
+      {ownerData?.sacco && (
+        <Card className="bg-gradient-to-r from-emerald-700 to-teal-700 text-white border-none">
+          <CardContent className="p-4 flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
+                <Building2 className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="font-bold text-lg">{ownerData.sacco.name}</p>
+                <p className="text-xs text-emerald-100">
+                  {ownerData.sacco.code ? `Code: ${ownerData.sacco.code} • ` : ''}
+                  Region: {ownerData.sacco.region} • Owner: {ownerData.owner.name}
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-2 text-center">
+              <div className="bg-white/15 px-3 py-1.5 rounded">
+                <p className="text-lg font-bold leading-none">{ownerData.analytics?.totalBuses ?? 0}</p>
+                <p className="text-[10px] text-emerald-100">Buses</p>
+              </div>
+              <div className="bg-white/15 px-3 py-1.5 rounded">
+                <p className="text-lg font-bold leading-none">{ownerData.analytics?.totalRoutes ?? 0}</p>
+                <p className="text-[10px] text-emerald-100">Routes</p>
+              </div>
+              <div className="bg-white/15 px-3 py-1.5 rounded">
+                <p className="text-lg font-bold leading-none">{ownerData.analytics?.totalPassengersAllTime ?? 0}</p>
+                <p className="text-[10px] text-emerald-100">Passengers</p>
+              </div>
+              <div className="bg-white/15 px-3 py-1.5 rounded">
+                <p className="text-lg font-bold leading-none">KES {(ownerData.analytics?.totalRevenueAllTime ?? 0).toLocaleString()}</p>
+                <p className="text-[10px] text-emerald-100">All-time Rev</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Fleet Overview Stats */}
       {fleetData?.stats && (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
@@ -2409,22 +3068,140 @@ function OwnerPanel({
         </Card>
       )}
 
-      {/* Live Bus Tracking Map */}
-      {typeof window !== 'undefined' && leafletReady && (
+      {/* ─── Route & Bus Manager ──────────────────────────────────── */}
+      {/* Multi-SACCO core: each SACCO can register their own numbered
+          Nairobi-style routes and add buses (14, 33, or 11 seater). */}
+      <Tabs defaultValue="routes" className="w-full">
+        <TabsList className="grid grid-cols-2 w-full">
+          <TabsTrigger value="routes" className="flex items-center gap-1.5">
+            <RouteIcon className="w-4 h-4" /> Routes
+          </TabsTrigger>
+          <TabsTrigger value="buses" className="flex items-center gap-1.5">
+            <Bus className="w-4 h-4" /> Buses
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="routes" className="mt-3">
+          <RouteManager ownerId={ownerId} onRoutesChanged={onRefresh} />
+        </TabsContent>
+        <TabsContent value="buses" className="mt-3">
+          <BusManager ownerId={ownerId} routes={routes} onBusesChanged={onRefresh} />
+        </TabsContent>
+      </Tabs>
+
+      {/* ─── Multi-Bus Fleet Map ──────────────────────────────────── */}
+      {/* Shows ALL buses in the SACCO on one map, each with their own
+          route polyline + stop markers + live position marker. */}
+      {typeof window !== 'undefined' && leafletReady && fleetData?.fleet?.length > 0 && (
         <Card>
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between flex-wrap gap-2">
               <CardTitle className="text-lg flex items-center gap-2">
                 <MapPin className="w-5 h-5 text-emerald-600" />
-                Live Bus Tracking
+                Live Fleet Map
+                <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 ml-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1" />
+                  {fleetData.stats?.tracking ?? 0} of {fleetData.stats?.totalBuses ?? 0} live
+                </Badge>
+              </CardTitle>
+              <div className="text-xs text-gray-500">
+                {ownerData?.sacco?.name} • {fleetData.fleet.length} buses
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div style={{ height: '420px', borderRadius: '8px', overflow: 'hidden' }}>
+              <MapContainer
+                center={fleetData.fleet[0]?.position
+                  ? [fleetData.fleet[0].position.lat, fleetData.fleet[0].position.lng]
+                  : (ownerData?.sacco?.region === 'Nairobi' ? [-1.2864, 36.8172] : [-4.05, 39.67])}
+                zoom={12}
+                style={{ height: '100%', width: '100%' }}
+                scrollWheelZoom={false}
+              >
+                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' />
+
+                {/* Render each bus with its own route line + stops + position */}
+                {fleetData.fleet.map((bus: any, idx: number) => {
+                  // Different color per bus
+                  const colors = ['#10b981', '#3b82f6', '#a855f7', '#f59e0b', '#ec4899', '#06b6d4']
+                  const color = colors[idx % colors.length]
+                  return (
+                    <React.Fragment key={bus.id}>
+                      {/* This bus's route line */}
+                      {bus.routeLine?.length > 0 && (
+                        <Polyline
+                          positions={bus.routeLine.map((p: any) => [p.lat, p.lng])}
+                          pathOptions={{ color, weight: 3, opacity: 0.4 }}
+                        />
+                      )}
+                      {/* This bus's route stops */}
+                      {bus.routeStops?.map((stop: any) => (
+                        <Marker key={`${bus.id}-stop-${stop.order}`} position={[stop.lat, stop.lng]}>
+                          <Popup>
+                            <strong>{stop.stopName}</strong><br />
+                            Stop #{stop.order} • {bus.registrationNumber}
+                          </Popup>
+                        </Marker>
+                      ))}
+                      {/* Live bus marker */}
+                      {bus.position && (
+                        <Marker position={[bus.position.lat, bus.position.lng]}>
+                          <Popup>
+                            <strong>🚌 {bus.name}</strong><br />
+                            Reg: {bus.registrationNumber}<br />
+                            {bus.routeCode ? `Route #${bus.routeCode} • ` : ''}{bus.routeName || 'No route'}<br />
+                            Speed: {bus.speed || 0} km/h<br />
+                            {bus.isOffRoute && <span style={{ color: 'red' }}>⚠️ Off route!</span>}
+                            <br />
+                            Updated: {bus.lastGpsAt ? new Date(bus.lastGpsAt).toLocaleTimeString() : 'N/A'}
+                          </Popup>
+                        </Marker>
+                      )}
+                    </React.Fragment>
+                  )
+                })}
+              </MapContainer>
+            </div>
+
+            {/* Fleet legend */}
+            <div className="flex flex-wrap gap-3 mt-3 text-xs">
+              {fleetData.fleet.map((bus: any, idx: number) => {
+                const colors = ['#10b981', '#3b82f6', '#a855f7', '#f59e0b', '#ec4899', '#06b6d4']
+                const color = colors[idx % colors.length]
+                return (
+                  <div key={bus.id} className="flex items-center gap-1.5 bg-gray-50 px-2 py-1 rounded border">
+                    <span className="w-2.5 h-2.5 rounded-full" style={{ background: color }} />
+                    <span className="font-medium">{bus.registrationNumber}</span>
+                    <span className="text-gray-400">·</span>
+                    <span className="text-gray-500">{bus.speed || 0} km/h</span>
+                    {bus.isOffRoute && <Badge variant="destructive" className="text-[9px] h-4 px-1">OFF</Badge>}
+                    {bus.isTracking && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" title="Live tracking" />
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ─── Single-Bus Live Bus Tracking (focus on the selected bus) ── */}
+      {typeof window !== 'undefined' && leafletReady && busData && (
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <CardTitle className="text-lg flex items-center gap-2">
+                <Navigation className="w-5 h-5 text-emerald-600" />
+                Selected Bus: {busData.registrationNumber}
                 <Badge variant="default" className="bg-emerald-100 text-emerald-700 border-emerald-300 ml-1">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1" />
                   {gpsData?.speed ? 'Moving' : 'Idle'}
                 </Badge>
               </CardTitle>
               <div className="flex items-center gap-3 text-xs text-gray-500">
-                <span>Bus: <strong className="text-emerald-700">{busData?.registrationNumber || 'KBA 234J'}</strong></span>
-                <span>Route: <strong className="text-emerald-700">{busData?.route?.name?.split('→')[0]?.trim() || 'Likoni'}</strong></span>
+                <span>Bus: <strong className="text-emerald-700">{busData.registrationNumber}</strong></span>
+                <span>Route: <strong className="text-emerald-700">{busData.route?.name || 'No route'}</strong></span>
               </div>
             </div>
           </CardHeader>
@@ -2461,7 +3238,7 @@ function OwnerPanel({
                   <Marker position={[gpsData.currentLocation.lat, gpsData.currentLocation.lng]}>
                     <Popup>
                       <strong>🚌 {busData?.name || 'MatatuLink Bus'}</strong><br />
-                      Reg: {busData?.registrationNumber || 'KBA 234J'}<br />
+                      Reg: {busData?.registrationNumber}<br />
                       Speed: {gpsData.speed} km/h<br />
                       Heading: {gpsData.heading}°<br />
                       Updated: {new Date(gpsData.lastUpdated).toLocaleTimeString()}
@@ -2608,30 +3385,84 @@ function OwnerPanel({
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-7 gap-1.5">
-              {seats.map(seat => {
-                const isOccupied = occupiedSet.has(seat.number)
-                const p = seat.passenger
-                let bgColor = 'bg-emerald-100 border-emerald-300'
-                if (isOccupied && p) {
-                  if (p.paymentStatus === 'unpaid' || p.paymentStatus === 'pending') {
-                    bgColor = 'bg-yellow-100 border-yellow-400'
-                  } else if (p.alightingStopOrder <= currentStopIndex + 2) {
-                    bgColor = 'bg-red-100 border-red-400'
-                  } else {
-                    bgColor = 'bg-orange-100 border-orange-400'
-                  }
-                }
+            {/* Layout-aware mini seat map (uses row/col for 33-seater) */}
+            {(() => {
+              const hasLayout = seats.length > 0 && seats.every(s => s.row !== undefined && s.col !== undefined)
+              if (hasLayout) {
+                const maxRow = Math.max(...seats.map(s => s.row as number))
+                const maxCol = Math.max(...seats.map(s => s.col as number))
+                const seatsByRowCol = new Map<string, Seat>()
+                seats.forEach(s => seatsByRowCol.set(`${s.row}-${s.col}`, s))
                 return (
-                  <div
-                    key={seat.id}
-                    className={`p-1 rounded border text-center text-xs ${bgColor}`}
-                  >
-                    {seat.number}
+                  <div className="overflow-x-auto">
+                    <div
+                      className="grid gap-1 mx-auto"
+                      style={{
+                        gridTemplateColumns: `repeat(${maxCol}, minmax(20px, 28px))`,
+                        gridTemplateRows: `repeat(${maxRow}, minmax(22px, 28px))`,
+                        width: 'fit-content',
+                      }}
+                    >
+                      {Array.from({ length: maxRow }).map((_, rIdx) =>
+                        Array.from({ length: maxCol }).map((__, cIdx) => {
+                          const seat = seatsByRowCol.get(`${rIdx + 1}-${cIdx + 1}`)
+                          if (!seat) return <div key={`${rIdx}-${cIdx}`} />
+                          const p = seat.passenger
+                          let bgColor = 'bg-emerald-100 border-emerald-300'
+                          if (seat.isOccupied && p) {
+                            if (p.paymentStatus === 'unpaid' || p.paymentStatus === 'pending') {
+                              bgColor = 'bg-yellow-100 border-yellow-400'
+                            } else if (p.alightingStopOrder <= currentStopIndex + 2) {
+                              bgColor = 'bg-red-100 border-red-400'
+                            } else {
+                              bgColor = 'bg-orange-100 border-orange-400'
+                            }
+                          }
+                          return (
+                            <div
+                              key={seat.id}
+                              className={`p-0.5 rounded border text-center text-[10px] leading-tight ${bgColor}`}
+                              title={`Seat ${seat.number}${p ? ` · ${p.name || 'Passenger'}` : ' · Free'}`}
+                            >
+                              {seat.number}
+                            </div>
+                          )
+                        })
+                      )}
+                    </div>
+                    <p className="text-[10px] text-gray-400 text-center mt-2">
+                      {seats.length} seats · {busData?.layoutType?.replace('_', ' ') || 'matatu 14'}
+                    </p>
                   </div>
                 )
-              })}
-            </div>
+              }
+              return (
+                <div className="grid grid-cols-7 gap-1.5">
+                  {seats.map(seat => {
+                    const isOccupied = occupiedSet.has(seat.number)
+                    const p = seat.passenger
+                    let bgColor = 'bg-emerald-100 border-emerald-300'
+                    if (isOccupied && p) {
+                      if (p.paymentStatus === 'unpaid' || p.paymentStatus === 'pending') {
+                        bgColor = 'bg-yellow-100 border-yellow-400'
+                      } else if (p.alightingStopOrder <= currentStopIndex + 2) {
+                        bgColor = 'bg-red-100 border-red-400'
+                      } else {
+                        bgColor = 'bg-orange-100 border-orange-400'
+                      }
+                    }
+                    return (
+                      <div
+                        key={seat.id}
+                        className={`p-1 rounded border text-center text-xs ${bgColor}`}
+                      >
+                        {seat.number}
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })()}
             <div className="flex gap-3 mt-3 text-xs text-gray-500">
               <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-emerald-100 border border-emerald-300" /> Free</span>
               <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-100 border border-red-400" /> Alighting</span>

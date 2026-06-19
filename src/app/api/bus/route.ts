@@ -1,9 +1,30 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { resolveSaccoContext } from "@/lib/sacco-context";
 
-export async function GET() {
+/**
+ * GET /api/bus?busId=...&ownerId=...
+ *
+ * - If busId is provided: returns that bus (must belong to caller's SACCO).
+ * - Otherwise: returns the SACCO's primary bus (first one created),
+ *   for backward compatibility with single-bus panels.
+ *
+ * Either way the caller is scoped to their own SACCO via resolveSaccoContext.
+ */
+export async function GET(req: Request) {
   try {
+    const ctx = await resolveSaccoContext(req);
+    if (!ctx) {
+      return NextResponse.json({ error: "No owner found" }, { status: 404 });
+    }
+
+    const url = new URL(req.url);
+    const busId = url.searchParams.get("busId");
+
+    const where = { saccoid: ctx.saccoId, ...(busId ? { id: busId } : {}) };
+
     const bus = await db.bus.findFirst({
+      where,
       include: {
         route: {
           include: { stops: { orderBy: { order: "asc" } } },

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { resolveSaccoContext } from "@/lib/sacco-context";
 import {
   buildRouteLine,
   haversineDistance,
@@ -9,26 +10,25 @@ import {
   type RouteStopGPS,
 } from "@/lib/gps-intelligence";
 
-// Same route stops as in /api/gps — in production this would come from DB
-const ROUTE_STOPS: RouteStopGPS[] = [
-  { lat: -4.0753, lng: 39.6672, stopName: "Likoni Ferry", order: 1 },
-  { lat: -4.0710, lng: 39.6740, stopName: "Shelly Beach", order: 2 },
-  { lat: -4.0550, lng: 39.6850, stopName: "Kongowea", order: 3 },
-  { lat: -4.0450, lng: 39.7000, stopName: "Nyali Bridge", order: 4 },
-  { lat: -4.0380, lng: 39.7100, stopName: "Mamba Village", order: 5 },
-  { lat: -4.0300, lng: 39.7200, stopName: "Citizen TV Roundabout", order: 6 },
-  { lat: -4.0250, lng: 39.7280, stopName: "Nyali Centre", order: 7 },
-  { lat: -4.0180, lng: 39.7350, stopName: "Bamburi", order: 8 },
-  { lat: -4.0050, lng: 39.7450, stopName: "Mtwapa", order: 9 },
-  { lat: -4.0500, lng: 39.6700, stopName: "Mombasa CBD (Tusker)", order: 10 },
-];
-
-const ROUTE_LINE = buildRouteLine(ROUTE_STOPS);
-
-export async function GET() {
+/**
+ * GET /api/fleet?ownerId=...
+ *
+ * Returns every bus in the calling owner's SACCO, each enriched with:
+ *   - route stops + route line (pulled from the DB, not hardcoded)
+ *   - off-route detection + geofence
+ *   - ETA to the next stop based on actual speed
+ *
+ * Owner never sees buses from other SACCOs.
+ */
+export async function GET(req: Request) {
   try {
-    // Get all buses with their live state + active trip
+    const ctx = await resolveSaccoContext(req);
+    if (!ctx) {
+      return NextResponse.json({ error: "No owner found" }, { status: 404 });
+    }
+
     const buses = await db.bus.findMany({
+      where: { saccoid: ctx.saccoId },
       include: {
         route: { include: { stops: { orderBy: { order: "asc" } } } },
         sacco: true,
@@ -38,23 +38,34 @@ export async function GET() {
           orderBy: { startTime: "desc" },
         },
       },
+      orderBy: { createdAt: "asc" },
     });
 
+    // Per-bus intelligence
     const fleet = buses.map((bus) => {
+      // Convert DB stops → RouteStopGPS format expected by gps-intelligence lib
+      const routeStops: RouteStopGPS[] = (bus.route?.stops ?? []).map((s) => ({
+        lat: s.lat ?? 0,
+        lng: s.lng ?? 0,
+        stopName: s.name,
+        order: s.order,
+      }));
+      const routeLine = buildRouteLine(routeStops);
+
       const pos = bus.lastLat && bus.lastLng
         ? { lat: bus.lastLat, lng: bus.lastLng }
         : null;
 
       let intelligence: any = null;
-      if (pos) {
-        const offRouteInfo = isOffRoute(pos, ROUTE_LINE);
-        const atStopIdx = findCurrentStop(pos, ROUTE_STOPS);
+      if (pos && routeStops.length > 0) {
+        const offRouteInfo = isOffRoute(pos, routeLine);
+        const atStopIdx = findCurrentStop(pos, routeStops);
         const activeTrip = bus.trips[0];
         const currentStopIndex = activeTrip?.currentStopIndex ?? 0;
 
         intelligence = {
           atStopIndex: atStopIdx,
-          atStopName: atStopIdx >= 0 ? ROUTE_STOPS[atStopIdx].stopName : null,
+          atStopName: atStopIdx >= 0 ? routeStops[atStopIdx].stopName : null,
           isOffRoute: offRouteInfo.offRoute,
           offRouteDistance: Math.round(offRouteInfo.distance),
           currentStopIndex,
@@ -62,9 +73,10 @@ export async function GET() {
             pos,
             currentStopIndex,
             currentStopIndex + 1,
-            ROUTE_STOPS,
+            routeStops,
             bus.lastSpeed ?? 0
           ),
+          routeCode: bus.route?.code ?? null,
         };
       }
 
@@ -74,6 +86,9 @@ export async function GET() {
         registrationNumber: bus.registrationNumber,
         saccoName: bus.sacco?.name,
         routeName: bus.route?.name,
+        routeCode: bus.route?.code ?? null,
+        layoutType: bus.layoutType,
+        totalSeats: bus.totalSeats,
         position: pos,
         speed: bus.lastSpeed ?? 0,
         heading: bus.lastHeading ?? 0,
@@ -84,6 +99,10 @@ export async function GET() {
         totalPassengers: bus.trips[0]?.totalPassengers ?? 0,
         totalRevenue: bus.trips[0]?.totalRevenue ?? 0,
         intelligence,
+        // For the Owner map: include each bus's own route line + stops
+        // so the map can render the correct polyline per bus.
+        routeStops,
+        routeLine,
       };
     });
 
@@ -99,10 +118,9 @@ export async function GET() {
     };
 
     return NextResponse.json({
+      sacco: { id: ctx.saccoId, name: ctx.saccoName, region: ctx.region },
       fleet,
       stats,
-      routeStops: ROUTE_STOPS,
-      routeLine: ROUTE_LINE,
     });
   } catch (error) {
     console.error("Error fetching fleet:", error);

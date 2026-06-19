@@ -10,7 +10,10 @@ datasource db {
 model SACCO {
   id        String   @id @default(cuid())
   name      String
+  region    String   @default("Mombasa") // Mombasa, Nairobi, Kisumu, etc.
+  code      String?  // e.g. "LKN-EXP", "CITIHOPA"
   buses     Bus[]
+  routes    Route[]
   owner     Owner?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -21,11 +24,13 @@ model Bus {
   name             String
   registrationNumber String  @unique
   totalSeats       Int      @default(14)
+  layoutType       String   @default("matatu_14") // matatu_14, coaster_33, van_11
   saccoid          String
   sacco            SACCO    @relation(fields: [saccoid], references: [id])
   seats            Seat[]
   trips            Trip[]
-  route            Route?
+  routeId          String?
+  route            Route?   @relation(fields: [routeId], references: [id])
   gpsHistory       GPSHistory[]
   // Live state (last known)
   lastLat          Float?
@@ -37,16 +42,27 @@ model Bus {
   isOffRoute       Boolean  @default(false)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
+
+  @@index([saccoid])
 }
 
 model Route {
   id        String   @id @default(cuid())
-  name      String
-  busId     String   @unique
-  bus       Bus      @relation(fields: [busId], references: [id])
+  name      String   // human label, e.g. "Likoni → Mombasa CBD"
+  code      String?  // Nairobi-style numbered route, e.g. "33", "110", "237"
+  region    String   @default("Mombasa") // Nairobi, Mombasa, Kisumu...
+  saccoId   String
+  sacco     SACCO    @relation(fields: [saccoId], references: [id])
+  buses     Bus[]
   stops     Stop[]
+  // Optional bounding-box-ish metadata for fleet map zoom
+  centerLat Float?
+  centerLng Float?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([saccoId])
+  @@index([code, region])
 }
 
 model Stop {
@@ -54,15 +70,22 @@ model Stop {
   name      String
   order     Int
   isStage   Boolean  @default(true)
+  lat       Float?
+  lng       Float?
+  fareFromOrigin Float? @default(0) // suggested fare from route origin
   routeId   String
   route     Route    @relation(fields: [routeId], references: [id])
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([routeId])
 }
 
 model Seat {
   id          String   @id @default(cuid())
   number      Int
+  row         Int     @default(0)  // physical row in the bus
+  col         Int     @default(0)  // physical column (for layout rendering)
   busId       String
   bus         Bus      @relation(fields: [busId], references: [id])
   isOccupied  Boolean  @default(false)
@@ -71,6 +94,7 @@ model Seat {
   updatedAt   DateTime @updatedAt
 
   @@unique([number, busId])
+  @@index([busId])
 }
 
 model Passenger {
@@ -92,6 +116,8 @@ model Passenger {
   trip           Trip?    @relation(fields: [tripId], references: [id])
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
+
+  @@index([busId])
 }
 
 model Trip {
@@ -107,6 +133,8 @@ model Trip {
   endTime         DateTime?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
+
+  @@index([busId])
 }
 
 model Transaction {
@@ -130,6 +158,9 @@ model NotificationLog {
   createdAt DateTime @default(now())
 }
 
+// Owner is the auth principal in multi-SACCO mode.
+// For demo we look up the first Owner, in production this would be
+// tied to a session/JWT carrying ownerId.
 model Owner {
   id        String   @id @default(cuid())
   name      String

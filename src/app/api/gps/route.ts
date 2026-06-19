@@ -12,22 +12,27 @@ import {
   type RouteStopGPS,
 } from "@/lib/gps-intelligence";
 
-// Approximate real coordinates for Likoni → Mombasa route
-const ROUTE_STOPS: RouteStopGPS[] = [
-  { lat: -4.0753, lng: 39.6672, stopName: "Likoni Ferry", order: 1 },
-  { lat: -4.0710, lng: 39.6740, stopName: "Shelly Beach", order: 2 },
-  { lat: -4.0550, lng: 39.6850, stopName: "Kongowea", order: 3 },
-  { lat: -4.0450, lng: 39.7000, stopName: "Nyali Bridge", order: 4 },
-  { lat: -4.0380, lng: 39.7100, stopName: "Mamba Village", order: 5 },
-  { lat: -4.0300, lng: 39.7200, stopName: "Citizen TV Roundabout", order: 6 },
-  { lat: -4.0250, lng: 39.7280, stopName: "Nyali Centre", order: 7 },
-  { lat: -4.0180, lng: 39.7350, stopName: "Bamburi", order: 8 },
-  { lat: -4.0050, lng: 39.7450, stopName: "Mtwapa", order: 9 },
-  { lat: -4.0500, lng: 39.6700, stopName: "Mombasa CBD (Tusker)", order: 10 },
-];
+/**
+ * Helper: load a bus's route (with stops) and convert to the shape
+ * expected by the gps-intelligence library. Returns null if the bus
+ * has no route or its stops lack coordinates.
+ */
+async function loadRouteStops(busId: string): Promise<RouteStopGPS[] | null> {
+  const bus = await db.bus.findUnique({
+    where: { id: busId },
+    include: { route: { include: { stops: { orderBy: { order: "asc" } } } } },
+  });
+  if (!bus?.route?.stops?.length) return null;
+  // If any stop is missing coordinates, fall back to 0,0 (will not break math)
+  return bus.route.stops.map((s) => ({
+    lat: s.lat ?? 0,
+    lng: s.lng ?? 0,
+    stopName: s.name,
+    order: s.order,
+  }));
+}
 
-const ROUTE_LINE = buildRouteLine(ROUTE_STOPS);
-
+// GET /api/gps?busId=...&history=true&limit=20
 export async function GET(request: Request) {
   try {
     const url = new URL(request.url);
@@ -58,18 +63,22 @@ export async function GET(request: Request) {
       }
     }
 
-    // Fallback to route origin if no data yet
-    const currentLocation = latest ?? ROUTE_STOPS[0];
+    // Load bus route stops from DB (or empty array if bus has no route)
+    const ROUTE_STOPS: RouteStopGPS[] = busId ? (await loadRouteStops(busId)) ?? [] : [];
+    const ROUTE_LINE = buildRouteLine(ROUTE_STOPS);
+
+    // Fallback: if no GPS data yet and no route stops, use 0,0
+    const currentLocation = latest ?? ROUTE_STOPS[0] ?? { lat: 0, lng: 0 };
     const speed = latest?.speed ?? 0;
     const heading = latest?.heading ?? 0;
     const lastUpdated = latest?.timestamp ?? new Date().toISOString();
 
     // Geofence: which stop are we at?
-    const atStopIdx = findCurrentStop(currentLocation, ROUTE_STOPS);
-    const nearestUpcoming = findNearestUpcomingStop(currentLocation, ROUTE_STOPS, 0);
+    const atStopIdx = ROUTE_STOPS.length > 0 ? findCurrentStop(currentLocation, ROUTE_STOPS) : -1;
+    const nearestUpcoming = ROUTE_STOPS.length > 0 ? findNearestUpcomingStop(currentLocation, ROUTE_STOPS, 0) : { index: -1, distance: 0 };
 
     // Off-route check
-    const offRouteInfo = isOffRoute(currentLocation, ROUTE_LINE);
+    const offRouteInfo = ROUTE_LINE.length > 0 ? isOffRoute(currentLocation, ROUTE_LINE) : { offRoute: false, distance: 0 };
 
     // ETA to each upcoming stop
     const etas = ROUTE_STOPS.map((stop, i) => ({
@@ -79,10 +88,9 @@ export async function GET(request: Request) {
       distanceMeters: Math.round(haversineDistance(currentLocation, stop)),
     }));
 
-    // Route progress %
-    const progress = routeProgress(currentLocation, ROUTE_STOPS, ROUTE_LINE);
+    const progress = ROUTE_LINE.length > 0 ? routeProgress(currentLocation, ROUTE_STOPS, ROUTE_LINE) : 0;
 
-    // Get recent history (either from DB or empty)
+    // Recent history
     let gpsHistory: Array<{ lat: number; lng: number; speed: number; heading: number; timestamp: string }> = [];
     let historyCount = 0;
     if (includeHistory && busId) {
@@ -112,7 +120,6 @@ export async function GET(request: Request) {
       lastUpdated,
       historyCount,
       gpsHistory,
-      // Intelligence
       atStopIndex: atStopIdx,
       atStopName: atStopIdx >= 0 ? ROUTE_STOPS[atStopIdx].stopName : null,
       nearestUpcomingStop: nearestUpcoming,
@@ -128,6 +135,8 @@ export async function GET(request: Request) {
   }
 }
 
+// POST /api/gps
+// Body: { busId, lat, lng, speed, heading, accuracy, source }
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -137,12 +146,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "busId is required" }, { status: 400 });
     }
 
-    // Compute off-route + geofence info
     const point = { lat, lng };
-    const offRouteInfo = isOffRoute(point, ROUTE_LINE);
-    const atStopIdx = findCurrentStop(point, ROUTE_STOPS);
+    const ROUTE_STOPS = (await loadRouteStops(busId)) ?? [];
+    const ROUTE_LINE = buildRouteLine(ROUTE_STOPS);
+    const offRouteInfo = ROUTE_LINE.length > 0 ? isOffRoute(point, ROUTE_LINE) : { offRoute: false, distance: 0 };
+    const atStopIdx = ROUTE_STOPS.length > 0 ? findCurrentStop(point, ROUTE_STOPS) : -1;
 
-    // Persist to DB
     const point_row = await db.gPSHistory.create({
       data: {
         busId,
@@ -157,7 +166,6 @@ export async function POST(request: Request) {
       },
     });
 
-    // Update bus live state
     await db.bus.update({
       where: { id: busId },
       data: {
@@ -171,7 +179,7 @@ export async function POST(request: Request) {
       },
     });
 
-    // Cleanup old GPS history (>24h old) to keep DB lean
+    // Cleanup old GPS history (>24h)
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
     await db.gPSHistory.deleteMany({
       where: { createdAt: { lt: cutoff } },
