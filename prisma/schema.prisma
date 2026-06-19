@@ -114,6 +114,11 @@ model Passenger {
   fare           Float    @default(0)
   paymentStatus  String   @default("unpaid") // unpaid, pending, paid
   paymentMethod  String?  // mpesa, nfc, qr, cash, card
+  // clientId — used by the offline replay path to de-dupe queued M-Pesa
+  // payments so a single boarding never results in two passengers / two
+  // transactions when the network flaps. Set when the passenger POST is
+  // generated client-side (even when online, for forward compatibility).
+  clientId       String?  @unique
   boardedAt      DateTime @default(now())
   alightedAt     DateTime?
   tripId         String?

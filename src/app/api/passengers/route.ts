@@ -28,7 +28,25 @@ export async function POST(request: Request) {
       name, phone, seatNumber,
       boardingStop, alightingStop, alightingStopOrder,
       isCustomAlighting, fare, paymentMethod, busId,
+      clientId,
     } = data;
+
+    // Offline-replay de-dupe: if a clientId is present and a passenger
+    // was already created with that clientId (e.g. the SW replayed a
+    // queued payment AND the client also retried online), return the
+    // existing row with 200 instead of creating a duplicate.
+    if (clientId) {
+      const existing = await db.passenger.findUnique({
+        where: { clientId },
+        include: { seat: true },
+      });
+      if (existing) {
+        return NextResponse.json(
+          { passenger: existing, deduped: true, message: "Already boarded" },
+          { status: 200 }
+        );
+      }
+    }
 
     const bus = await db.bus.findFirst({ where: { id: busId } });
     if (!bus) return NextResponse.json({ error: "Bus not found" }, { status: 404 });
@@ -58,6 +76,7 @@ export async function POST(request: Request) {
         paymentStatus: paymentMethod ? "paid" : "unpaid",
         paymentMethod: paymentMethod || null,
         tripId: activeTrip.id,
+        clientId: clientId || null,
       },
     });
 

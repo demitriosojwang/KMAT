@@ -1,0 +1,36 @@
+{
+  "name": "MatatuLink — Passenger",
+  "short_name": "MatatuLink",
+  "description": "Scan, ride, pay — Kenyan matatu communication & payment. Works offline.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1e3a8a",
+  "theme_color": "#1e3a8a",
+  "categories": ["travel", "navigation", "finance"],
+  "lang": "en",
+  "dir": "ltr",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Board a Bus",
+      "short_name": "Board",
+      "url": "/?action=board",
+      "description": "Select your seat and destination"
+    }
+  ]
+}

@@ -16,6 +16,7 @@ import {
   User, ArrowRight, Radio, Bell as BellIcon,
   Plus, Route as RouteIcon, Trash2, Building2,
   LogIn, LogOut, Mail, Lock, Upload, FileSpreadsheet,
+  WifiOff, Wifi, CloudOff, RefreshCw, Hourglass,
 } from 'lucide-react'
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -33,6 +34,10 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip,
   ResponsiveContainer, PieChart, Pie, Cell
 } from 'recharts'
+
+import { useOnlineStatus } from '@/hooks/use-online-status'
+import { useOfflineQueue } from '@/hooks/use-offline-queue'
+import { setCache, getCacheStale } from '@/lib/offline-db'
 
 // ─── Types ────────────────────────────────────────────────────────
 interface Stop {
@@ -964,12 +969,43 @@ function PassengerPanel({
   const [mpesaPhone, setMpesaPhone] = useState('')
   const [processing, setProcessing] = useState(false)
   const [confirmed, setConfirmed] = useState(false)
+  const [staleGps, setStaleGps] = useState(false)
+
+  // --- Offline architecture (Phase 3) ---
+  const isOnline = useOnlineStatus()
+  const { queueCount, isReplaying, enqueue, replay } = useOfflineQueue()
+  const [queuedLocally, setQueuedLocally] = useState(false)
 
   const selectedStopData = stops.find(s => s.name === selectedStop)
   // Fare matrix: fare = (alightingStop.fareFromOrigin) − (boardingStop.fareFromOrigin).
   // For custom (free-text) alighting, default to the last stop's fare.
   const usingCustom = customStop.trim().length > 0
   const fare = computeFare(stops, currentStopIndex, usingCustom ? null : selectedStop, usingCustom)
+
+  // Cache GPS + stops in IndexedDB so they survive a navigation away
+  // and back, or a closed-and-reopened PWA. The SW does its own SWR
+  // for /api/gps, but having a copy in IDB also lets the UI render
+  // *something* even before the SW responds on a cold start.
+  useEffect(() => {
+    if (gpsData) {
+      setCache(`gps:${busData?.id ?? 'default'}`, gpsData, 60_000).catch(() => {})
+      setStaleGps(false)
+    }
+  }, [gpsData, busData?.id])
+
+  useEffect(() => {
+    if (stops?.length) {
+      setCache(`stops:${busData?.id ?? 'default'}`, stops, 5 * 60_000).catch(() => {})
+    }
+  }, [stops, busData?.id])
+
+  // Stale-GPS detection: if we haven't seen a fresh ping in >30s, flag it
+  useEffect(() => {
+    if (!gpsData?.lastGpsAt) return
+    const last = new Date(gpsData.lastGpsAt).getTime()
+    const ageMs = Date.now() - last
+    setStaleGps(ageMs > 30_000)
+  }, [gpsData?.lastGpsAt])
 
   // Leaflet state for mini tracker (must be before any early return)
   const [miniLeafletReady, setMiniLeafletReady] = useState(false)
@@ -1018,21 +1054,89 @@ function PassengerPanel({
       const stopOrder = usingCustom
         ? (stops[stops.length - 1]?.order ?? 1)  // custom drop-off: treat as last stop
         : (selectedStopData?.order || 1)
+
+      // --- Offline-aware boarding ---
+      // Generate a clientId so the server can de-dupe this exact boarding
+      // if it arrives twice (once from SW Background Sync replay, once
+      // from a client-side retry on reconnect). This is the single most
+      // important line of the offline architecture: it prevents a
+      // passenger from being charged twice for the same seat.
+      const clientId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `ml_${Date.now()}_${Math.random().toString(36).slice(2)}`
+
+      const payload = {
+        name: null,
+        phone: paymentMethod === 'mpesa' ? mpesaPhone : null,
+        seatNumber: selectedSeat,
+        boardingStop: stops[currentStopIndex]?.name || 'Unknown',
+        alightingStop: usingCustom ? customStop.trim() : selectedStop,
+        alightingStopOrder: stopOrder,
+        isCustomAlighting: usingCustom,
+        fare,
+        paymentMethod,
+        busId: busData?.id,
+      }
+
+      if (!isOnline) {
+        // --- Offline path ---
+        // Stash the boarding in IndexedDB. The SW's Background Sync
+        // will pick it up the moment connectivity returns and POST it
+        // to /api/passengers. Even if the PWA is closed before sync,
+        // the queue persists — next time the passenger opens the app
+        // the useOfflineQueue hook replays it on mount.
+        await enqueue({ id: clientId, payload })
+        setProcessing(false)
+        setQueuedLocally(true)
+        setConfirmed(true)
+        toast.info('Queued — will sync when back online', {
+          description: `Seat ${selectedSeat} reserved locally • KES ${fare}`,
+          icon: <CloudOff className="w-4 h-4" />,
+          duration: 5000,
+        })
+
+        // Optimistically emit WS event so crew sees the boarding
+        // immediately when this tablet reconnects. Crew UI continues
+        // to mark the seat as "pending sync" until the server confirms.
+        if (busData?.id) {
+          emitSocket('passenger_boarded', {
+            busId: busData.id,
+            passenger: {
+              id: clientId,
+              name: null,
+              phone: paymentMethod === 'mpesa' ? mpesaPhone : null,
+              seatNumber: selectedSeat,
+              boardingStop: stops[currentStopIndex]?.name || 'Unknown',
+              alightingStop: usingCustom ? customStop.trim() : selectedStop,
+              alightingStopOrder: stopOrder,
+              isCustomAlighting: usingCustom,
+              fare,
+              paymentStatus: 'pending_sync',
+              paymentMethod,
+              boardedAt: new Date().toISOString(),
+              queuedOffline: true,
+            },
+          })
+        }
+
+        setTimeout(() => {
+          setConfirmed(false)
+          setQueuedLocally(false)
+          setStep(1)
+          setSelectedSeat(null)
+          setSelectedStop('')
+          setCustomStop('')
+          setPaymentMethod('')
+          setMpesaPhone('')
+        }, 3500)
+        return
+      }
+
+      // --- Online path ---
       const res = await fetch('/api/passengers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: null,
-          phone: paymentMethod === 'mpesa' ? mpesaPhone : null,
-          seatNumber: selectedSeat,
-          boardingStop: stops[currentStopIndex]?.name || 'Unknown',
-          alightingStop: usingCustom ? customStop.trim() : selectedStop,
-          alightingStopOrder: stopOrder,
-          isCustomAlighting: usingCustom,
-          fare,
-          paymentMethod,
-          busId: busData?.id,
-        }),
+        body: JSON.stringify({ ...payload, clientId }),
       })
       const data = await res.json()
 
@@ -1093,13 +1197,26 @@ function PassengerPanel({
         <motion.div
           animate={{ scale: [1, 1.2, 1] }}
           transition={{ duration: 0.5, repeat: 2 }}
-          className="w-20 h-20 rounded-full bg-blue-100 flex items-center justify-center mb-6"
+          className={`w-20 h-20 rounded-full flex items-center justify-center mb-6 ${
+            queuedLocally ? 'bg-yellow-100' : 'bg-blue-100'
+          }`}
         >
-          <CheckCircle2 className="w-10 h-10 text-blue-600" />
+          {queuedLocally ? (
+            <CloudOff className="w-10 h-10 text-yellow-600" />
+          ) : (
+            <CheckCircle2 className="w-10 h-10 text-blue-600" />
+          )}
         </motion.div>
-        <h2 className="text-2xl font-bold text-blue-800 mb-2">You&apos;re all set! 🎉</h2>
+        <h2 className={`text-2xl font-bold mb-2 ${queuedLocally ? 'text-yellow-700' : 'text-blue-800'}`}>
+          {queuedLocally ? 'Queued offline ⏸' : "You're all set! 🎉"}
+        </h2>
         <p className="text-gray-600">Seat {selectedSeat} • {customStop || selectedStop}</p>
-        <p className="text-blue-600 font-semibold mt-1">KES {fare}</p>
+        <p className={`${queuedLocally ? 'text-yellow-700' : 'text-blue-600'} font-semibold mt-1`}>KES {fare}</p>
+        {queuedLocally && (
+          <p className="text-xs text-gray-500 mt-3 max-w-xs text-center">
+            Your booking is saved on this device. It will sync to the conductor automatically when you reconnect.
+          </p>
+        )}
       </motion.div>
     )
   }
@@ -1127,6 +1244,85 @@ function PassengerPanel({
         <h2 className="text-2xl font-bold text-blue-800">Welcome aboard! 🚌</h2>
         <p className="text-gray-500 mt-1">Select your seat and destination</p>
       </div>
+
+      {/* Offline / Connectivity banner (Phase 3) */}
+      <AnimatePresence>
+        {!isOnline && (
+          <motion.div
+            initial={{ opacity: 0, y: -10, height: 0 }}
+            animate={{ opacity: 1, y: 0, height: 'auto' }}
+            exit={{ opacity: 0, y: -10, height: 0 }}
+            className="bg-yellow-50 border-2 border-yellow-400 rounded-lg p-3 flex items-center gap-3"
+          >
+            <div className="w-8 h-8 rounded-full bg-yellow-100 flex items-center justify-center shrink-0">
+              <WifiOff className="w-4 h-4 text-yellow-700" />
+            </div>
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-yellow-800">
+                You&apos;re offline — but you can still board
+              </p>
+              <p className="text-xs text-yellow-700">
+                Your booking will be saved on this device and synced to the conductor when you reconnect.
+              </p>
+            </div>
+            {queueCount > 0 && (
+              <Badge className="bg-yellow-500 text-yellow-950 hover:bg-yellow-500 shrink-0">
+                <Hourglass className="w-3 h-3 mr-1" />
+                {queueCount} queued
+              </Badge>
+            )}
+          </motion.div>
+        )}
+        {isOnline && queueCount > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="bg-blue-50 border-2 border-blue-300 rounded-lg p-3 flex items-center gap-3"
+          >
+            <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center shrink-0">
+              {isReplaying ? (
+                <RefreshCw className="w-4 h-4 text-blue-700 animate-spin" />
+              ) : (
+                <Wifi className="w-4 h-4 text-blue-700" />
+              )}
+            </div>
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-blue-800">
+                {isReplaying ? 'Syncing your queued booking…' : `${queueCount} booking${queueCount > 1 ? 's' : ''} queued`}
+              </p>
+              <p className="text-xs text-blue-600">
+                {isReplaying ? 'Almost done — confirming with the conductor.' : 'Click below to retry now, or it will sync automatically.'}
+              </p>
+            </div>
+            {!isReplaying && (
+              <Button size="sm" variant="outline" className="border-blue-400 text-blue-700 hover:bg-blue-100" onClick={replay}>
+                <RefreshCw className="w-3 h-3 mr-1" /> Sync now
+              </Button>
+            )}
+          </motion.div>
+        )}
+        {isOnline && staleGps && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="bg-orange-50 border border-orange-300 rounded-lg p-2.5 flex items-center gap-3"
+          >
+            <div className="w-7 h-7 rounded-full bg-orange-100 flex items-center justify-center shrink-0">
+              <CloudOff className="w-3.5 h-3.5 text-orange-700" />
+            </div>
+            <div className="flex-1">
+              <p className="text-xs font-semibold text-orange-800">
+                Live bus data paused — showing last known position
+              </p>
+              <p className="text-[11px] text-orange-700">
+                The bus tablet may be in a tunnel or dead-zone. Your seat + fare are still valid.
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Off-route alert banner */}
       {gpsData?.isOffRoute && (
