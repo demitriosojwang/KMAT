@@ -128,30 +128,12 @@ export async function markPaymentFailed(id: string, error: string): Promise<void
   }
 }
 
-export async function clearSyncedPayments(): Promise<void> {
-  const db = await getDB();
-  const all = await db.getAll("paymentQueue");
-  await Promise.all(
-    all.filter((p) => p.status === "synced").map((p) => db.delete("paymentQueue", p.id))
-  );
-}
-
 // ---------- Generic cache ----------
 
 export async function setCache<T>(key: string, value: T, ttlMs?: number): Promise<void> {
   const db = await getDB();
   const entry: CacheEntry<T> = { key, value, cachedAt: Date.now(), ttlMs };
   await db.put("cache", entry);
-}
-
-export async function getCache<T>(key: string): Promise<{ value: T; cachedAt: number } | null> {
-  const db = await getDB();
-  const entry = (await db.get("cache", key)) as CacheEntry<T> | undefined;
-  if (!entry) return null;
-  if (entry.ttlMs && Date.now() - entry.cachedAt > entry.ttlMs) {
-    return null; // expired
-  }
-  return { value: entry.value, cachedAt: entry.cachedAt };
 }
 
 export async function getCacheStale<T>(key: string): Promise<{ value: T; cachedAt: number; isStale: boolean } | null> {

@@ -20,15 +20,6 @@ export interface RouteStopGPS extends LatLng {
   stopName: string
 }
 
-export interface GPSReading {
-  lat: number
-  lng: number
-  speed: number // km/h
-  heading: number // degrees
-  accuracy?: number // meters
-  timestamp: string
-}
-
 export interface GeofenceEvent {
   type: 'stop_arrival' | 'stop_departure' | 'off_route' | 'back_on_route'
   stopIndex?: number
@@ -279,24 +270,4 @@ export function routeProgress(
   }
 
   return Math.min(100, Math.max(0, Math.round((consumed / totalDist) * 100)))
-}
-
-// ─── Speed analytics ────────────────────────────────────────────────
-
-export interface SpeedStats {
-  average: number
-  max: number
-  min: number
-  samples: number
-}
-
-export function computeSpeedStats(history: GPSReading[]): SpeedStats {
-  if (history.length === 0) return { average: 0, max: 0, min: 0, samples: 0 }
-  const speeds = history.map(h => h.speed)
-  return {
-    average: speeds.reduce((a, b) => a + b, 0) / speeds.length,
-    max: Math.max(...speeds),
-    min: Math.min(...speeds),
-    samples: history.length,
-  }
 }

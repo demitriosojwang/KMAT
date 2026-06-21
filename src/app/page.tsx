@@ -147,6 +147,7 @@ interface GPSData {
   offRouteThreshold?: number
   routeProgressPercent?: number
   etas?: Array<{ order: number; stopName: string; etaMinutes: number | null; distanceMeters: number }>
+  lastGpsAt?: string
 }
 
 // ─── Color helpers ────────────────────────────────────────────────
