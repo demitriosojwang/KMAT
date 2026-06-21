@@ -92,6 +92,13 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return
 
   // Cross-origin: Leaflet tiles
+  // ponytail: tile cache cap=200. Ceiling: a passenger PWA viewing a single
+  // urban route sees ~60-80 unique tiles; 200 covers a detour or two. Rural
+  // routes with multi-zoom panning can blow past 200 and start evicting
+  // tiles the passenger is about to need. Upgrade: raise to 500 if rural
+  // SACCOs report tile-thrash (look for repeated `cache.put` after
+  // `cache.keys().length > maxEntries` in SW logs), or per-route cache
+  // partitioning if multiple SACCOs share a device.
   if (url.hostname.endsWith('tile.openstreetmap.org') || url.hostname.endsWith('cdnjs.cloudflare.com')) {
     event.respondWith(cacheFirstWithCap(req, TILES_CACHE, 200))
     return

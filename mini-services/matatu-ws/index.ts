@@ -1,5 +1,12 @@
 import { Server } from "socket.io";
 
+// ponytail: in-memory busState + geofenceState Maps. Ceiling: single Node
+// process, ~100 concurrent buses before per-bus state grows past V8's
+// comfortable working set and GC pauses start visible on the WS ping loop.
+// Upgrade: move to Redis (pub/sub + per-bus hash keys) so multiple WS
+// workers can share state, then horizontally scale the WS tier behind
+// sticky-session load balancing.
+
 const PORT = 3003;
 
 const io = new Server(PORT, {
