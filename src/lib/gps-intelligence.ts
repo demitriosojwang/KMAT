@@ -179,26 +179,6 @@ export function findCurrentStop(point: LatLng, stops: RouteStopGPS[], radius = G
   return -1
 }
 
-/**
- * Find the nearest upcoming stop (at or after currentStopIndex).
- */
-export function findNearestUpcomingStop(
-  point: LatLng,
-  stops: RouteStopGPS[],
-  currentStopIndex: number
-): { index: number; distance: number } {
-  let nearestIdx = currentStopIndex
-  let nearestDist = Infinity
-  for (let i = currentStopIndex; i < stops.length; i++) {
-    const d = haversineDistance(point, stops[i])
-    if (d < nearestDist) {
-      nearestDist = d
-      nearestIdx = i
-    }
-  }
-  return { index: nearestIdx, distance: nearestDist }
-}
-
 // ─── ETA calculation ────────────────────────────────────────────────
 
 /**
