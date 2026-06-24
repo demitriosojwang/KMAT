@@ -182,3 +182,58 @@ Stage Summary:
   render offline (with a "live data paused" banner).
 - PWA is installable (manifest + 192/512 icons + standalone display) so repeat
   riders can "Add to Home Screen" from the QR-scanned browser tab.
+
+---
+Task ID: 5
+Agent: Main Agent
+Task: Restructure into passenger-first landing + 3 interfaces (passenger/crew/admin)
+
+Work Log:
+- Created 3 public API routes (no auth required) for the passenger flow:
+  - GET /api/public/saccos — lists every SACCO with live/total bus counts
+  - GET /api/public/buses?saccoId=... — lists buses with seat availability, GPS, active trip
+  - GET /api/public/bus?busId=... — same shape as authed /api/bus (bus + trip + transactions)
+- Extracted all shared session/socket/data logic into a custom hook:
+  src/hooks/use-sacco-session.ts — auth state, bus list, selectedBus, bus/trip/gps/fleet
+  fetchers, WS lifecycle, sign-in/out handlers, derived stops/seats/passengersOnBoard
+- Built shared shell components used by both /crew and /admin:
+  - src/components/shell/sign-in-card.tsx — NextAuth credentials form with demo-account picker
+  - src/components/shell/crew-admin-header.tsx — logo + SACCO name + section nav (Passenger/Crew/Admin) + bus selector + sign-out
+- Refactored src/app/page.tsx → PUBLIC PASSENGER-FIRST LANDING (no auth):
+  - Hero: "Board your matatu. Pay with M-Pesa. Track every stop."
+  - Feature pills (offline, M-Pesa, GPS, no double-charge)
+  - "Find your matatu" SACCO picker + expandable bus list with live GPS dot,
+    seat availability bar, and "Board this matatu" deep-link to /passenger?bus=ID
+  - Three role cards (Passenger active / Crew / Admin) at the bottom
+  - Auto-refreshes bus list every 15s for live GPS dot
+- Created src/app/passenger/page.tsx — public passenger interface:
+  - If ?bus=ID in URL: skip picker, fetch bus directly, render PassengerPanel
+  - If no ?bus: render SACCO + bus picker with search
+  - Owns its own socket + bus/gps data fetching (no auth needed)
+  - "Change bus" link back to landing, "Crew"/"Admin" links in footer
+- Created src/app/crew/page.tsx — auth-gated crew interface:
+  - SignInCard when unauthenticated (with "Crew Sign-in" tagline)
+  - Two tabs: Conductor (ConductorPanel) + Driver (DriverPanel)
+  - Uses CrewAdminHeader with section="crew"
+- Created src/app/admin/page.tsx — auth-gated admin (SACCO owner) interface:
+  - SignInCard when unauthenticated (with "SACCO Owner Sign-in" tagline)
+  - Renders OwnerPanel (fleet map, revenue dashboard, route/bus managers)
+  - Uses CrewAdminHeader with section="admin"
+- Verified with curl: all 4 routes return 200, both public APIs return valid JSON,
+  deep-link /passenger?bus=ID works, /api/public/bus returns full bus+trip shape
+
+Stage Summary:
+- Landing page is now PUBLIC and PASSENGER-FIRST — no auth wall, just "find your matatu"
+- Three distinct interfaces, each with its own URL, header, and entry experience:
+  - /           → public passenger landing (browse SACCOs + buses, deep-link to boarding)
+  - /passenger  → public boarding flow (seat picker → M-Pesa → confirmation, offline-capable)
+  - /crew       → auth-gated conductor + driver combined console
+  - /admin      → auth-gated SACCO owner / fleet admin console
+- Cross-linking: every header has Passenger/Crew/Admin nav buttons so staff can
+  switch roles without going back to the home page
+- No code duplication: useSaccoSession hook + SignInCard + CrewAdminHeader are
+  shared between crew and admin
+- Existing panels (PassengerPanel, ConductorPanel, DriverPanel, OwnerPanel)
+  are reused unchanged — only the routing shell around them changed
+- All offline architecture (IndexedDB queue, SW Background Sync, clientId de-dupe)
+  still works because PassengerPanel is the same component, just mounted at /passenger

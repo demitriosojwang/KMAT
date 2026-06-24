@@ -1,664 +1,541 @@
 'use client'
 
 /**
- * MatatuLink — router shell.
+ * MatatuLink landing page — PASSENGER-FIRST.
  *
- * This file used to contain all four panels (4224 LOC). After the
- * ponytail-audit split (Phase 7), it is just the router shell:
- *   - NextAuth session hydration
- *   - Sign-in screen (when unauthenticated)
- *   - Tab switcher (Passenger / Conductor / Driver / Owner)
- *   - WebSocket lifecycle + bus-room join
- *   - Bus / Trip / GPS / Fleet data fetching
- *   - Forwards shared state into the four panel components
+ * Public (no auth). The flow is:
+ *   1. Hero: "Find your matatu" — explains the value prop.
+ *   2. SACCO picker — pulled from /api/public/saccos. Clicking a
+ *      SACCO expands its live buses.
+ *   3. Each bus card shows: route, registration, live GPS dot,
+ *      seat availability, and a "Board this matatu" button that
+ *      deep-links to /passenger?bus=<id>.
+ *   4. Three role cards at the bottom: Passenger (active), Crew,
+ *      Admin — so SACCO staff know where to sign in.
  *
- * The panels themselves live in:
- *   src/components/passenger-panel.tsx
- *   src/components/conductor-panel.tsx
- *   src/components/driver-panel.tsx
- *   src/components/owner-panel.tsx   (also contains RouteManager + BusManager)
+ * The passenger does NOT need an account to board — they just need
+ * to know which SACCO operates their route. This mirrors how Kenyan
+ * matatus actually work: riders wave down a bus by livery, not by
+ * logging in.
  */
-import React, { useState, useEffect, useCallback, useRef } from 'react'
-import { io, Socket } from 'socket.io-client'
-import { toast } from 'sonner'
-import { signIn, signOut, useSession } from 'next-auth/react'
+import React, { useEffect, useState } from 'react'
+import Link from 'next/link'
 import {
-  Bus, Users, UserCheck, Car, BarChart3,
-  RotateCcw, LogIn, Mail, Lock,
+  Bus, MapPin, Users, Wifi, WifiOff, Navigation,
+  UserCheck, BarChart3, ArrowRight, Search, ShieldCheck,
+  CreditCard, CloudOff, Clock,
 } from 'lucide-react'
-
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 
-import { PassengerPanel } from '@/components/passenger-panel'
-import { ConductorPanel } from '@/components/conductor-panel'
-import { DriverPanel } from '@/components/driver-panel'
-import { OwnerPanel } from '@/components/owner-panel'
-import type {
-  BusData, GPSData, Stop, Seat, TripData, Transaction, WSNotification,
-} from '@/lib/types'
+interface PublicSacco {
+  id: string
+  name: string
+  region: string
+  code: string | null
+  totalBuses: number
+  liveBuses: number
+}
 
-type TabType = 'passenger' | 'conductor' | 'driver' | 'owner'
+interface PublicBus {
+  id: string
+  name: string
+  registrationNumber: string
+  layoutType: string
+  sacco: { id: string; name: string; region: string; code: string | null }
+  route: {
+    id: string
+    name: string
+    code: string | null
+    stops: Array<{ id: string; name: string; order: number; fareFromOrigin: number | null }>
+  } | null
+  totalSeats: number
+  occupiedSeats: number
+  availableSeats: number
+  isTracking: boolean
+  isOffRoute: boolean
+  lastLat: number | null
+  lastLng: number | null
+  lastSpeed: number
+  lastGpsAt: string | null
+  activeTrip: { id: string; status: string; currentStopIndex: number; startTime: string } | null
+}
 
-export default function Home() {
-  // NextAuth session — drives the SACCO context. When unauthenticated
-  // the user sees a sign-in card instead of the dashboard.
-  const { data: session, status } = useSession()
+export default function LandingPage() {
+  const [saccos, setSaccos] = useState<PublicSacco[]>([])
+  const [expandedSaccoId, setExpandedSaccoId] = useState<string | null>(null)
+  const [buses, setBuses] = useState<PublicBus[]>([])
+  const [loadingBuses, setLoadingBuses] = useState(false)
+  const [query, setQuery] = useState('')
 
-  const [activeTab, setActiveTab] = useState<TabType>('passenger')
-  const [busData, setBusData] = useState<BusData | null>(null)
-  const [tripData, setTripData] = useState<TripData | null>(null)
-  const [transactions, setTransactions] = useState<Transaction[]>([])
-  const [notifications, setNotifications] = useState<WSNotification[]>([])
-  const [gpsData, setGpsData] = useState<GPSData | null>(null)
-  const [fleetData, setFleetData] = useState<any>(null)
-  const [loading, setLoading] = useState(true)
-  const socketRef = useRef<Socket | null>(null)
-  const busDataRef = useRef<BusData | null>(null)
-  const activeTabRef = useRef<TabType>('passenger')
-  const fetchFleetDataRef = useRef<(() => Promise<void>) | null>(null)
-
-  // ─── Multi-SACCO state ──────────────────────────────────────────
-  // After NextAuth login the ownerId comes from the session JWT. We
-  // still keep the ownerId in local state so existing fetch helpers
-  // don't need to be rewritten.
-  const sessionOwnerId = (session as any)?.ownerId as string | undefined
-  const [ownerId, setOwnerId] = useState<string | null>(sessionOwnerId ?? null)
-  const [ownerList, setOwnerList] = useState<Array<{ email: string; name: string; saccoName: string; region: string }>>([])
-  const [ownerMeta, setOwnerMeta] = useState<{ saccoName: string; region: string } | null>(null)
-
-  // ─── Sign-in form state ─────────────────────────────────────────
-  const [signInEmail, setSignInEmail] = useState('')
-  const [signInPassword, setSignInPassword] = useState('')
-  const [signInLoading, setSignInLoading] = useState(false)
-
-  // ─── Active bus selector (Conductor/Driver/Passenger operate one bus) ─
-  const [busList, setBusList] = useState<Array<{ id: string; name: string; registrationNumber: string; totalSeats: number; layoutType?: string; routeName?: string | null; routeCode?: string | null }>>([])
-  const [selectedBusId, setSelectedBusId] = useState<string | null>(null)
-
-  // ─── Fleet data fetching (for Owner panel) ────────────────────
-  const fetchFleetData = useCallback(async () => {
-    try {
-      const qs = ownerId ? `?ownerId=${encodeURIComponent(ownerId)}` : ''
-      const res = await fetch(`/api/fleet${qs}`)
-      const data = await res.json()
-      setFleetData(data)
-    } catch (e) {
-      console.error('Failed to fetch fleet data', e)
-    }
-  }, [ownerId])
-
-  // Keep refs in sync for use inside socket callbacks
+  // ─── Load SACCOs on mount ──────────────────────────────────────
   useEffect(() => {
-    busDataRef.current = busData
-  }, [busData])
-
-  useEffect(() => {
-    activeTabRef.current = activeTab
-  }, [activeTab])
-
-  useEffect(() => {
-    fetchFleetDataRef.current = fetchFleetData
-  }, [fetchFleetData])
-
-  // ─── Data fetching ────────────────────────────────────────────
-  const fetchBusData = useCallback(async () => {
-    try {
-      const params = new URLSearchParams()
-      if (ownerId) params.set('ownerId', ownerId)
-      if (selectedBusId) params.set('busId', selectedBusId)
-      const qs = params.toString()
-      const res = await fetch(`/api/bus${qs ? `?${qs}` : ''}`)
-      const data = await res.json()
-      if (data.bus) setBusData(data.bus)
-      if (data.trip) setTripData(data.trip)
-      if (data.transactions) setTransactions(data.transactions)
-    } catch (e) {
-      console.error('Failed to fetch bus data', e)
-    }
-  }, [ownerId, selectedBusId])
-
-  const fetchTripData = useCallback(async () => {
-    try {
-      const res = await fetch('/api/trip')
-      const data = await res.json()
-      if (data.trip) setTripData(data.trip)
-    } catch (e) {
-      console.error('Failed to fetch trip data', e)
-    }
+    fetch('/api/public/saccos')
+      .then(r => r.json())
+      .then(data => {
+        setSaccos(data.saccos ?? [])
+        // Auto-expand the first SACCO that has live buses
+        const firstLive = (data.saccos ?? []).find((s: PublicSacco) => s.liveBuses > 0)
+        if (firstLive) setExpandedSaccoId(firstLive.id)
+      })
+      .catch(e => console.error('Failed to load SACCOs', e))
   }, [])
 
-  const fetchGpsData = useCallback(async () => {
-    try {
-      const busId = busDataRef.current?.id
-      const params = new URLSearchParams()
-      if (busId) {
-        params.set('busId', busId)
-        params.set('history', 'true')
-        params.set('limit', '20')
-      }
-      const url = `/api/gps${params.toString() ? `?${params}` : ''}`
-      const res = await fetch(url)
-      const data = await res.json()
-      setGpsData(data)
-    } catch (e) {
-      console.error('Failed to fetch GPS data', e)
-    }
-  }, [])
-
-  // ─── Socket emit helpers (access ref in callbacks, not during render) ─
-  const emitSocket = useCallback((event: string, data: any) => {
-    socketRef.current?.emit(event, data)
-  }, [])
-
-  // ─── Initial load ─────────────────────────────────────────────
+  // ─── Load buses when a SACCO is expanded ───────────────────────
   useEffect(() => {
-    const load = async () => {
-      setLoading(true)
-      // Fetch /api/me — returns the current session (if any) plus the
-      // list of demo owner emails so the sign-in card can show a
-      // "try a demo account" hint.
-      try {
-        const res = await fetch('/api/me')
-        const data = await res.json()
-        if (data.authenticated && data.owner?.id) {
-          setOwnerId(data.owner.id)
-          setOwnerMeta({ saccoName: data.sacco.name, region: data.sacco.region })
-        } else {
-          setOwnerId(null)
-        }
-        if (data.demoOwners?.length) {
-          setOwnerList(data.demoOwners)
-        }
-      } catch (e) {
-        console.error('Failed to fetch /api/me', e)
-      }
-      await fetchBusData()
-      await fetchGpsData()
-      setLoading(false)
-    }
-    load()
-  }, [])
-
-  // Whenever the NextAuth session changes (login / logout), re-sync.
-  useEffect(() => {
-    if (sessionOwnerId) {
-      setOwnerId(sessionOwnerId)
-    } else if (status === 'unauthenticated') {
-      // Don't wipe ownerId on initial loading state — only when we
-      // definitively know the user is signed out.
-      setOwnerId(null)
-    }
-  }, [sessionOwnerId, status])
-
-  // ─── Sign-in handler ───────────────────────────────────────────
-  const handleSignIn = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!signInEmail || !signInPassword) {
-      toast.error('Email and password are required')
+    if (!expandedSaccoId) {
+      setBuses([])
       return
     }
-    setSignInLoading(true)
-    try {
-      const result = await signIn('credentials', {
-        email: signInEmail,
-        password: signInPassword,
-        redirect: false,
-      })
-      if (result?.error) {
-        toast.error('Invalid email or password')
-      } else {
-        toast.success('Signed in!')
-        // Force a session refresh — NextAuth's useSession will pick
-        // this up automatically, but we also reload to be safe.
-        setTimeout(() => window.location.reload(), 400)
-      }
-    } catch (err) {
-      toast.error('Sign-in failed')
-    } finally {
-      setSignInLoading(false)
-    }
-  }
+    setLoadingBuses(true)
+    fetch(`/api/public/buses?saccoId=${encodeURIComponent(expandedSaccoId)}`)
+      .then(r => r.json())
+      .then(data => setBuses(data.buses ?? []))
+      .catch(e => console.error('Failed to load buses', e))
+      .finally(() => setLoadingBuses(false))
+  }, [expandedSaccoId])
 
-  const handleSignOut = async () => {
-    await signOut({ redirect: false })
-    setOwnerId(null)
-    setBusData(null)
-    setTripData(null)
-    setFleetData(null)
-    toast.info('Signed out')
-  }
-
-  // When ownerId changes, fetch the SACCO's bus list and refresh fleet
+  // Auto-refresh live bus data every 15s so the landing dot stays fresh
   useEffect(() => {
-    if (!ownerId) return
-    const loadSacco = async () => {
-      try {
-        const res = await fetch(`/api/buses?ownerId=${encodeURIComponent(ownerId)}`)
-        const data = await res.json()
-        if (data.buses) {
-          const simplified = data.buses.map((b: any) => ({
-            id: b.id,
-            name: b.name,
-            registrationNumber: b.registrationNumber,
-            totalSeats: b.totalSeats,
-            layoutType: b.layoutType,
-            routeName: b.route?.name ?? null,
-            routeCode: b.route?.code ?? null,
-          }))
-          setBusList(simplified)
-          // If currently-selected bus isn't in this SACCO, switch to first
-          if (!selectedBusId || !simplified.find((b: any) => b.id === selectedBusId)) {
-            setSelectedBusId(simplified[0]?.id ?? null)
-          }
-          setOwnerMeta({ saccoName: data.sacco.name, region: data.sacco.region })
-        }
-      } catch (e) {
-        console.error('Failed to fetch buses for SACCO', e)
-      }
-    }
-    loadSacco()
-  }, [ownerId])
+    if (!expandedSaccoId) return
+    const id = setInterval(() => {
+      fetch(`/api/public/buses?saccoId=${encodeURIComponent(expandedSaccoId)}`)
+        .then(r => r.json())
+        .then(data => setBuses(data.buses ?? []))
+        .catch(() => {})
+    }, 15000)
+    return () => clearInterval(id)
+  }, [expandedSaccoId])
 
-  // When selectedBusId changes (or ownerId), refetch bus/trip/gps data
-  useEffect(() => {
-    if (selectedBusId) {
-      fetchBusData().then(() => fetchGpsData())
-      // Also re-join the new bus's WS room
-      if (socketRef.current?.connected) {
-        socketRef.current.emit('join_bus', selectedBusId)
-      }
-    }
-  }, [selectedBusId, ownerId, fetchBusData, fetchGpsData])
-
-  // ─── WebSocket ────────────────────────────────────────────────
-  useEffect(() => {
-    const socket = io('/?XTransformPort=3003', {
-      transports: ['websocket', 'polling'],
-    })
-    socketRef.current = socket
-
-    socket.on('connect', () => {
-      console.log('[WS] Connected')
-      // Will join bus after busData loads
-    })
-
-    socket.on('bus_state', (state: any) => {
-      if (state.notifications) {
-        setNotifications(prev => {
-          const merged = [...state.notifications, ...prev]
-          const seen = new Set<string>()
-          return merged.filter(n => {
-            if (seen.has(n.id)) return false
-            seen.add(n.id)
-            return true
-          }).slice(0, 50)
-        })
-      }
-    })
-
-    socket.on('passenger_boarded', (data: any) => {
-      toast.success(`🚌 ${data.name || 'Passenger'} boarded — Seat ${data.seatNumber}`, {
-        description: `Alighting at ${data.alightingStop}`,
-      })
-      fetchBusData()
-    })
-
-    socket.on('passenger_alighted', (data: any) => {
-      toast.info(`👋 Seat ${data.seatNumber} is now free`, {
-        description: 'Passenger alighted',
-      })
-      fetchBusData()
-      fetchTripData()
-    })
-
-    socket.on('payment_update', () => {
-      fetchBusData()
-      fetchTripData()
-    })
-
-    socket.on('advance_stop', () => {
-      fetchBusData()
-      fetchTripData()
-    })
-
-    socket.on('notification', (notif: WSNotification) => {
-      setNotifications(prev => [notif, ...prev].slice(0, 50))
-      if (notif.type === 'crew_broadcast') {
-        toast.info(`📢 ${notif.message}`)
-      } else if (notif.type === 'payment_alert') {
-        toast.error(`⚠️ ${notif.message}`)
-      }
-    })
-
-    socket.on('gps_update', (data: { busId: string; lat: number; lng: number; speed: number; heading: number; timestamp: string }) => {
-      setGpsData(prev => prev ? {
-        ...prev,
-        currentLocation: { lat: data.lat, lng: data.lng, speed: data.speed, heading: data.heading, timestamp: data.timestamp },
-        speed: data.speed,
-        heading: data.heading,
-        lastUpdated: data.timestamp,
-        gpsHistory: [...prev.gpsHistory, { lat: data.lat, lng: data.lng, speed: data.speed, heading: data.heading, timestamp: data.timestamp }].slice(-20),
-      } : prev)
-      // Also refresh fleet data when GPS updates (for Owner panel)
-      if (activeTabRef.current === 'owner') {
-        fetchFleetDataRef.current?.()
-      }
-    })
-
-    // Geofence events (auto-detect stop arrival/departure)
-    socket.on('geofence_event', (data: { type: string; stopIndex: number; stopName?: string; timestamp: string }) => {
-      if (data.type === 'stop_arrival' && data.stopName) {
-        toast.success(`📍 Arrived at ${data.stopName}`, { description: 'Geofence auto-detected' })
-      }
-    })
-
-    // Off-route alerts
-    socket.on('off_route_alert', (data: { distance?: number; cleared?: boolean; timestamp: string }) => {
-      if (data.cleared) {
-        toast.success('✅ Back on route')
-      } else if (data.distance) {
-        toast.error(`⚠️ Off route — ${Math.round(data.distance)}m from route!`, {
-          description: 'Owner has been notified',
-        })
-      }
-    })
-
-    return () => {
-      socket.disconnect()
-    }
-  }, [fetchBusData, fetchTripData])
-
-  // Re-join bus room when busData loads
-  useEffect(() => {
-    if (busData?.id && socketRef.current?.connected) {
-      socketRef.current.emit('join_bus', busData.id)
-    }
-  }, [busData?.id])
-
-  // ─── Seed / Reset ─────────────────────────────────────────────
-  const handleReset = async () => {
-    try {
-      await fetch('/api/seed', { method: 'POST' })
-      toast.success('Database reset!', { description: 'Demo data re-seeded.' })
-      await fetchBusData()
-    } catch {
-      toast.error('Failed to reset database')
-    }
-  }
-
-  // ─── Derived data ─────────────────────────────────────────────
-  const stops: Stop[] = busData?.route?.stops || []
-  const seats: Seat[] = busData?.seats || []
-  const currentStopIndex = tripData?.currentStopIndex || 0
-  const passengersOnBoard = tripData?.passengers?.filter(p => !p.alightedAt) || []
-
-  // ─── Tab config ───────────────────────────────────────────────
-  const tabs: { key: TabType; label: string; icon: React.ReactNode }[] = [
-    { key: 'passenger', label: 'Passenger', icon: <Users className="w-4 h-4" /> },
-    { key: 'conductor', label: 'Conductor', icon: <UserCheck className="w-4 h-4" /> },
-    { key: 'driver', label: 'Driver', icon: <Car className="w-4 h-4" /> },
-    { key: 'owner', label: 'Owner', icon: <BarChart3 className="w-4 h-4" /> },
-  ]
-
-  // ─── Loading state ────────────────────────────────────────────
-  if (loading || status === 'loading') {
+  const filteredSaccos = saccos.filter(s => {
+    if (!query.trim()) return true
+    const q = query.toLowerCase()
     return (
-      <div className="min-h-screen flex items-center justify-center bg-blue-50/50">
-        <div
-          className="text-center animate-in fade-in zoom-in-95 duration-200"
-        >
-          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-blue-700 flex items-center justify-center animate-pulse">
-            <Bus className="w-8 h-8 text-yellow-300" />
-          </div>
-          <h2 className="text-xl font-bold text-blue-900">MatatuLink</h2>
-          <p className="text-blue-600 text-sm mt-1">Loading…</p>
-        </div>
-      </div>
+      s.name.toLowerCase().includes(q) ||
+      s.region.toLowerCase().includes(q) ||
+      (s.code ?? '').toLowerCase().includes(q)
     )
-  }
+  })
 
-  // ─── Sign-in screen (unauthenticated) ────────────────────────
-  if (!ownerId) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-900 via-blue-800 to-blue-950 p-4">
-        <div
-          className="w-full max-w-md animate-in fade-in slide-in-from-bottom-5 duration-300"
-        >
-          <div className="text-center mb-6">
-            <div className="w-16 h-16 mx-auto mb-3 rounded-2xl bg-yellow-400 flex items-center justify-center shadow-xl">
-              <Bus className="w-8 h-8 text-blue-900" />
-            </div>
-            <h1 className="text-2xl font-bold text-white">MatatuLink</h1>
-            <p className="text-blue-200 text-sm mt-1">Kenyan Matatu System · SACCO Owner Sign-in</p>
-          </div>
-
-          <Card className="bg-white/95 backdrop-blur shadow-2xl">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-lg flex items-center gap-2 text-blue-900">
-                <LogIn className="w-5 h-5 text-blue-700" />
-                Sign in to your SACCO
-              </CardTitle>
-              <CardDescription>
-                Each owner only sees their own SACCO&apos;s buses, routes, and revenue.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <form onSubmit={handleSignIn} className="space-y-3">
-                <div>
-                  <Label className="text-xs font-medium text-gray-600 flex items-center gap-1">
-                    <Mail className="w-3 h-3" /> Email
-                  </Label>
-                  <Input
-                    type="email"
-                    placeholder="owner@sacco.co.ke"
-                    value={signInEmail}
-                    onChange={e => setSignInEmail(e.target.value)}
-                    className="mt-1"
-                    autoFocus
-                  />
-                </div>
-                <div>
-                  <Label className="text-xs font-medium text-gray-600 flex items-center gap-1">
-                    <Lock className="w-3 h-3" /> Password
-                  </Label>
-                  <Input
-                    type="password"
-                    placeholder="••••••••"
-                    value={signInPassword}
-                    onChange={e => setSignInPassword(e.target.value)}
-                    className="mt-1"
-                  />
-                </div>
-                <Button
-                  type="submit"
-                  disabled={signInLoading}
-                  className="w-full bg-blue-700 hover:bg-blue-800 text-white"
-                >
-                  {signInLoading ? 'Signing in…' : (
-                    <>
-                      <LogIn className="w-4 h-4 mr-2" />
-                      Sign in
-                    </>
-                  )}
-                </Button>
-              </form>
-
-              {ownerList.length > 0 && (
-                <div className="mt-4 pt-4 border-t border-gray-100">
-                  <p className="text-[11px] uppercase tracking-wide text-gray-500 mb-2">
-                    Demo accounts (click to prefill)
-                  </p>
-                  <div className="space-y-1.5">
-                    {ownerList.map(o => (
-                      <button
-                        key={o.email}
-                        onClick={() => {
-                          setSignInEmail(o.email)
-                          // Both demo accounts use the same password hint
-                          setSignInPassword(o.region === 'Nairobi' ? 'nairobi123' : 'matatu123')
-                        }}
-                        className="w-full text-left p-2 rounded border border-blue-100 bg-blue-50/40 hover:bg-blue-100 transition-colors"
-                      >
-                        <p className="text-xs font-medium text-blue-900">{o.name} · {o.saccoName}</p>
-                        <p className="text-[10px] text-gray-500">{o.email} · {o.region}</p>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <p className="text-center text-blue-300 text-xs mt-4">
-            © 2026 MatatuLink · Built for Kenyan SACCOs
-          </p>
-        </div>
-      </div>
-    )
-  }
+  const expandedSacco = saccos.find(s => s.id === expandedSaccoId)
 
   return (
-    <div className="min-h-screen flex flex-col bg-gradient-to-b from-blue-50/80 to-white">
-      {/* ─── Header ─────────────────────────────────────────────── */}
-      <header className="sticky top-0 z-50 bg-blue-800 text-white shadow-lg">
-        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-yellow-400 flex items-center justify-center shadow-md">
+    <div className="min-h-screen flex flex-col bg-gradient-to-b from-blue-50 to-white">
+      {/* ─── Top nav ───────────────────────────────────────────── */}
+      <nav className="sticky top-0 z-40 bg-blue-800 text-white shadow-md">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+          <Link href="/" className="flex items-center gap-2">
+            <div className="w-9 h-9 rounded-full bg-yellow-400 flex items-center justify-center shadow-md">
               <Bus className="w-5 h-5 text-blue-900" />
             </div>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight">MatatuLink</h1>
-              {ownerMeta && (
-                <p className="text-[10px] text-blue-200 leading-tight">
-                  {ownerMeta.saccoName} · {ownerMeta.region}
-                </p>
-              )}
+            <span className="text-lg font-bold tracking-tight">MatatuLink</span>
+          </Link>
+          <div className="flex items-center gap-1">
+            <Link
+              href="/passenger"
+              className="px-3 py-1.5 rounded-md text-xs font-medium bg-yellow-400 text-blue-900 hover:bg-yellow-300 transition-colors"
+            >
+              Passenger
+            </Link>
+            <Link
+              href="/crew"
+              className="px-3 py-1.5 rounded-md text-xs font-medium text-blue-100 hover:bg-blue-700/50 hover:text-white transition-colors"
+            >
+              Crew
+            </Link>
+            <Link
+              href="/admin"
+              className="px-3 py-1.5 rounded-md text-xs font-medium text-blue-100 hover:bg-blue-700/50 hover:text-white transition-colors"
+            >
+              Admin
+            </Link>
+          </div>
+        </div>
+      </nav>
+
+      {/* ─── Hero ──────────────────────────────────────────────── */}
+      <section className="bg-gradient-to-br from-blue-900 via-blue-800 to-blue-950 text-white">
+        <div className="max-w-6xl mx-auto px-4 py-12 md:py-20 grid md:grid-cols-2 gap-8 items-center">
+          <div>
+            <Badge className="bg-yellow-400 text-blue-900 hover:bg-yellow-300 mb-4">
+              Built for Kenyan SACCOs
+            </Badge>
+            <h1 className="text-3xl md:text-5xl font-bold tracking-tight leading-tight">
+              Board your matatu.<br />
+              <span className="text-yellow-400">Pay with M-Pesa.</span><br />
+              Track every stop.
+            </h1>
+            <p className="mt-4 text-blue-100 text-base md:text-lg max-w-md">
+              No app to install. No account needed. Find your SACCO,
+              pick a seat, and ride — even when the network drops.
+            </p>
+            <div className="mt-6 flex flex-wrap gap-3">
+              <a
+                href="#find-matatu"
+                className="inline-flex items-center gap-2 bg-yellow-400 text-blue-900 px-5 py-2.5 rounded-lg font-semibold hover:bg-yellow-300 transition-colors"
+              >
+                <Search className="w-4 h-4" />
+                Find your matatu
+              </a>
+              <Link
+                href="/passenger"
+                className="inline-flex items-center gap-2 border border-blue-400 text-white px-5 py-2.5 rounded-lg font-semibold hover:bg-blue-700/50 transition-colors"
+              >
+                I already know my bus
+                <ArrowRight className="w-4 h-4" />
+              </Link>
             </div>
           </div>
 
-          {/* Active bus selector */}
-          {busList.length > 0 && (
-            <select
-              value={selectedBusId ?? ''}
-              onChange={e => setSelectedBusId(e.target.value || null)}
-              className="bg-blue-900/60 text-white border border-blue-400 rounded-md px-2 py-1 text-xs"
-            >
-              {busList.map(b => (
-                <option key={b.id} value={b.id} className="text-black">
-                  {b.registrationNumber} · {b.routeCode ? `#${b.routeCode}` : b.routeName || 'No route'}
-                </option>
-              ))}
-            </select>
-          )}
+          {/* Feature pills */}
+          <div className="grid grid-cols-2 gap-3">
+            <FeatureCard
+              icon={<Wifi className="w-5 h-5" />}
+              title="Works offline"
+              body="Board + pay in dead zones. Syncs when you reconnect."
+            />
+            <FeatureCard
+              icon={<CreditCard className="w-5 h-5" />}
+              title="M-Pesa, cash, card"
+              body="Pay how you want. Conductor sees it instantly."
+            />
+            <FeatureCard
+              icon={<Navigation className="w-5 h-5" />}
+              title="Live GPS"
+              body="See the bus move. Know your stop is coming up."
+            />
+            <FeatureCard
+              icon={<ShieldCheck className="w-5 h-5" />}
+              title="No double-charge"
+              body="Every booking has a unique ID. Safe replay on reconnect."
+            />
+          </div>
+        </div>
+      </section>
 
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handleSignOut}
-            className="border-blue-400 text-blue-100 hover:bg-blue-700 hover:text-white"
-          >
-            Sign out
-          </Button>
+      {/* ─── Find your matatu ──────────────────────────────────── */}
+      <section id="find-matatu" className="max-w-6xl w-full mx-auto px-4 py-10 md:py-14">
+        <div className="mb-6">
+          <h2 className="text-2xl md:text-3xl font-bold text-blue-900">
+            Find your matatu
+          </h2>
+          <p className="text-gray-600 text-sm mt-1">
+            Pick your SACCO to see live buses. Tap a bus to choose your seat.
+          </p>
         </div>
 
-        {/* Tab bar */}
-        <div className="max-w-5xl mx-auto px-4 pb-2 flex gap-1 overflow-x-auto">
-          {tabs.map(tab => (
-            <button
-              key={tab.key}
-              onClick={() => setActiveTab(tab.key)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-t-md text-sm font-medium transition-all whitespace-nowrap ${
-                activeTab === tab.key
-                  ? 'bg-white text-blue-800 shadow-sm'
-                  : 'text-blue-100 hover:text-white hover:bg-blue-700/50'
-              }`}
-            >
-              {tab.icon}
-              {tab.label}
-            </button>
-          ))}
+        {/* Search bar */}
+        <div className="relative mb-6 max-w-md">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+          <Input
+            type="text"
+            placeholder="Search SACCO, region, or route code…"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            className="pl-10"
+          />
         </div>
-      </header>
 
-      {/* ─── Content ────────────────────────────────────────────── */}
-      <main className="flex-1 max-w-5xl w-full mx-auto px-4 py-6">
-        <div
-          key={activeTab}
-          className="animate-in fade-in slide-in-from-bottom-3 duration-200"
-        >
-          {activeTab === 'passenger' && (
-            <PassengerPanel
-              busData={busData}
-              tripData={tripData}
-              stops={stops}
-              seats={seats}
-              currentStopIndex={currentStopIndex}
-              gpsData={gpsData}
-              emitSocket={emitSocket}
-              onRefresh={fetchBusData}
+        {/* SACCO list */}
+        {saccos.length === 0 ? (
+          <div className="text-center py-12 text-gray-500">
+            <Bus className="w-12 h-12 mx-auto mb-3 opacity-30" />
+            <p>Loading SACCOs…</p>
+          </div>
+        ) : filteredSaccos.length === 0 ? (
+          <div className="text-center py-12 text-gray-500">
+            <p>No SACCOs match &ldquo;{query}&rdquo;.</p>
+          </div>
+        ) : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
+            {filteredSaccos.map(sacco => {
+              const isExpanded = sacco.id === expandedSaccoId
+              return (
+                <Card
+                  key={sacco.id}
+                  className={`cursor-pointer transition-all ${
+                    isExpanded ? 'ring-2 ring-blue-600 shadow-md' : 'hover:shadow-md'
+                  }`}
+                  onClick={() => setExpandedSaccoId(isExpanded ? null : sacco.id)}
+                >
+                  <CardHeader className="pb-3">
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <CardTitle className="text-base text-blue-900 flex items-center gap-2">
+                          <Bus className="w-4 h-4 text-blue-600" />
+                          {sacco.name}
+                        </CardTitle>
+                        <p className="text-xs text-gray-500 mt-1 flex items-center gap-1">
+                          <MapPin className="w-3 h-3" />
+                          {sacco.region}
+                          {sacco.code && (
+                            <Badge variant="secondary" className="ml-1 text-[10px] py-0">
+                              #{sacco.code}
+                            </Badge>
+                          )}
+                        </p>
+                      </div>
+                      {sacco.liveBuses > 0 && (
+                        <span className="flex items-center gap-1 text-[10px] font-semibold text-green-600 bg-green-50 px-2 py-0.5 rounded-full">
+                          <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                          LIVE
+                        </span>
+                      )}
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-gray-500">
+                        {sacco.totalBuses} bus{sacco.totalBuses !== 1 ? 'es' : ''}
+                      </span>
+                      <span className={sacco.liveBuses > 0 ? 'text-green-600 font-medium' : 'text-gray-400'}>
+                        {sacco.liveBuses} on the road
+                      </span>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant={isExpanded ? 'default' : 'outline'}
+                      className="w-full mt-3"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setExpandedSaccoId(isExpanded ? null : sacco.id)
+                      }}
+                    >
+                      {isExpanded ? 'Hide buses' : 'Show buses'}
+                      <ArrowRight className={`w-3.5 h-3.5 ml-1 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
+                    </Button>
+                  </CardContent>
+                </Card>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Expanded bus list */}
+        {expandedSacco && (
+          <div className="bg-white rounded-xl border border-blue-100 shadow-sm">
+            <div className="px-5 py-4 border-b border-blue-50 flex items-center justify-between">
+              <div>
+                <h3 className="font-semibold text-blue-900">{expandedSacco.name}</h3>
+                <p className="text-xs text-gray-500">
+                  {expandedSacco.region} · {buses.length} bus{buses.length !== 1 ? 'es' : ''} total
+                </p>
+              </div>
+              {loadingBuses && (
+                <span className="text-xs text-gray-400 flex items-center gap-1">
+                  <Clock className="w-3 h-3 animate-spin" />
+                  Refreshing…
+                </span>
+              )}
+            </div>
+
+            {buses.length === 0 ? (
+              <div className="p-8 text-center text-gray-500 text-sm">
+                No buses registered for this SACCO yet.
+              </div>
+            ) : (
+              <div className="divide-y divide-gray-50">
+                {buses.map(bus => (
+                  <BusRow key={bus.id} bus={bus} />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* ─── Three interfaces ─────────────────────────────────── */}
+      <section className="bg-blue-50/50 border-t border-blue-100">
+        <div className="max-w-6xl mx-auto px-4 py-12">
+          <h2 className="text-2xl md:text-3xl font-bold text-blue-900 text-center mb-2">
+            One platform, three faces
+          </h2>
+          <p className="text-gray-600 text-sm text-center mb-8 max-w-2xl mx-auto">
+            The passenger side is free and open. Crew and admin are auth-gated
+            so only your SACCO staff see your data.
+          </p>
+
+          <div className="grid md:grid-cols-3 gap-6">
+            <RoleCard
+              active
+              icon={<Users className="w-6 h-6" />}
+              title="Passenger"
+              tag="Public — no sign-in"
+              body="Find a matatu, pick your seat, pay with M-Pesa, track your stop. Works offline."
+              href="/passenger"
+              cta="Open passenger app"
             />
-          )}
-          {activeTab === 'conductor' && (
-            <ConductorPanel
-              busData={busData}
-              tripData={tripData}
-              stops={stops}
-              seats={seats}
-              currentStopIndex={currentStopIndex}
-              emitSocket={emitSocket}
-              notifications={notifications}
-              onRefresh={fetchBusData}
+            <RoleCard
+              icon={<UserCheck className="w-6 h-6" />}
+              title="Crew"
+              tag="Sign-in required"
+              body="Conductors board passengers, accept fares, broadcast messages. Drivers advance stops, track GPS."
+              href="/crew"
+              cta="Crew sign-in"
             />
-          )}
-          {activeTab === 'driver' && (
-            <DriverPanel
-              busData={busData}
-              tripData={tripData}
-              stops={stops}
-              seats={seats}
-              currentStopIndex={currentStopIndex}
-              passengersOnBoard={passengersOnBoard}
-              gpsData={gpsData}
-              emitSocket={emitSocket}
-              notifications={notifications}
-              onRefresh={() => { fetchBusData(); fetchTripData() }}
-              fetchGpsData={fetchGpsData}
+            <RoleCard
+              icon={<BarChart3 className="w-6 h-6" />}
+              title="Admin (SACCO owner)"
+              tag="Sign-in required"
+              body="Live fleet map, revenue dashboards, route manager, CSV route upload, fleet-wide alerts."
+              href="/admin"
+              cta="Admin sign-in"
             />
-          )}
-          {activeTab === 'owner' && (
-            <OwnerPanel
-              busData={busData}
-              tripData={tripData}
-              stops={stops}
-              seats={seats}
-              currentStopIndex={currentStopIndex}
-              transactions={transactions}
-              gpsData={gpsData}
-              fleetData={fleetData}
-              ownerId={ownerId}
-              onRefresh={() => { fetchBusData(); fetchFleetData() }}
-              onReset={handleReset}
-            />
-          )}
+          </div>
         </div>
-      </main>
+      </section>
 
-      {/* ─── Footer ──────────────────────────────────────────────── */}
-      <footer className="mt-auto border-t bg-white py-3">
-        <div className="max-w-5xl mx-auto px-4 flex items-center justify-between text-xs text-gray-500">
-          <span>© 2026 MatatuLink</span>
-          <button
-            onClick={handleReset}
-            className="flex items-center gap-1 text-gray-400 hover:text-red-500 transition-colors"
-          >
-            <RotateCcw className="w-3 h-3" />
-            Reset Demo
-          </button>
+      {/* ─── Footer ───────────────────────────────────────────── */}
+      <footer className="bg-blue-900 text-blue-100 py-6">
+        <div className="max-w-6xl mx-auto px-4 flex items-center justify-between text-xs flex-wrap gap-2">
+          <span>© 2026 MatatuLink · Built for Kenyan SACCOs</span>
+          <div className="flex items-center gap-3">
+            <Link href="/passenger" className="hover:text-white">Passenger</Link>
+            <Link href="/crew" className="hover:text-white">Crew</Link>
+            <Link href="/admin" className="hover:text-white">Admin</Link>
+          </div>
         </div>
       </footer>
+    </div>
+  )
+}
+
+function FeatureCard({ icon, title, body }: { icon: React.ReactNode; title: string; body: string }) {
+  return (
+    <div className="bg-white/10 backdrop-blur rounded-lg p-4 border border-white/20">
+      <div className="w-8 h-8 rounded-md bg-yellow-400 text-blue-900 flex items-center justify-center mb-2">
+        {icon}
+      </div>
+      <h4 className="font-semibold text-sm">{title}</h4>
+      <p className="text-blue-100 text-xs mt-1 leading-snug">{body}</p>
+    </div>
+  )
+}
+
+function RoleCard({
+  icon, title, tag, body, href, cta, active,
+}: {
+  icon: React.ReactNode
+  title: string
+  tag: string
+  body: string
+  href: string
+  cta: string
+  active?: boolean
+}) {
+  return (
+    <Card className={`flex flex-col ${active ? 'ring-2 ring-yellow-400' : ''}`}>
+      <CardHeader>
+        <div className="flex items-center gap-3">
+          <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
+            active ? 'bg-yellow-400 text-blue-900' : 'bg-blue-100 text-blue-700'
+          }`}>
+            {icon}
+          </div>
+          <div>
+            <CardTitle className="text-base">{title}</CardTitle>
+            <p className="text-[11px] text-gray-500">{tag}</p>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="flex-1 flex flex-col">
+        <p className="text-sm text-gray-600 mb-4 flex-1">{body}</p>
+        <Link
+          href={href}
+          className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            active
+              ? 'bg-blue-700 text-white hover:bg-blue-800'
+              : 'border border-blue-200 text-blue-700 hover:bg-blue-50'
+          }`}
+        >
+          {cta}
+          <ArrowRight className="w-3.5 h-3.5" />
+        </Link>
+      </CardContent>
+    </Card>
+  )
+}
+
+function BusRow({ bus }: { bus: PublicBus }) {
+  const available = bus.availableSeats
+  const total = bus.totalSeats
+  const occupancyPct = total > 0 ? Math.round((bus.occupiedSeats / total) * 100) : 0
+
+  const gpsAge = bus.lastGpsAt ? Math.round((Date.now() - new Date(bus.lastGpsAt).getTime()) / 1000) : null
+  const gpsFresh = gpsAge !== null && gpsAge < 60
+
+  const firstStop = bus.route?.stops[0]?.name
+  const lastStop = bus.route?.stops[bus.route.stops.length - 1]?.name
+
+  return (
+    <div className="p-4 hover:bg-blue-50/40 transition-colors">
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-semibold text-blue-900">{bus.registrationNumber}</span>
+            {bus.route?.code && (
+              <Badge variant="secondary" className="text-[10px] py-0">#{bus.route.code}</Badge>
+            )}
+            {bus.isTracking ? (
+              <span className="flex items-center gap-1 text-[10px] font-semibold text-green-600">
+                <span className={`w-1.5 h-1.5 bg-green-500 rounded-full ${gpsFresh ? 'animate-pulse' : ''}`} />
+                LIVE {gpsFresh ? '' : `· ${gpsAge}s ago`}
+              </span>
+            ) : (
+              <span className="flex items-center gap-1 text-[10px] font-semibold text-gray-400">
+                <WifiOff className="w-2.5 h-2.5" />
+                PARKED
+              </span>
+            )}
+            {bus.isOffRoute && (
+              <Badge variant="destructive" className="text-[10px] py-0">Off route</Badge>
+            )}
+          </div>
+          <p className="text-xs text-gray-500 mt-1 truncate">
+            {bus.route ? `${firstStop} → ${lastStop}` : 'No route assigned'}
+          </p>
+          {bus.activeTrip && (
+            <p className="text-[11px] text-blue-600 mt-0.5 flex items-center gap-1">
+              <Navigation className="w-2.5 h-2.5" />
+              Currently at stop #{bus.activeTrip.currentStopIndex + 1}
+              {bus.lastSpeed > 0 && ` · ${Math.round(bus.lastSpeed)} km/h`}
+            </p>
+          )}
+        </div>
+
+        {/* Seat availability bar */}
+        <div className="flex flex-col items-end gap-1 min-w-[120px]">
+          <div className="flex items-center gap-1.5 text-xs">
+            <Users className="w-3 h-3 text-gray-400" />
+            <span className={available === 0 ? 'text-red-600 font-semibold' : 'text-gray-700'}>
+              {available}/{total} free
+            </span>
+          </div>
+          <div className="w-24 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full ${
+                occupancyPct >= 90 ? 'bg-red-500' : occupancyPct >= 60 ? 'bg-yellow-500' : 'bg-green-500'
+              }`}
+              style={{ width: `${occupancyPct}%` }}
+            />
+          </div>
+        </div>
+
+        <Link
+          href={`/passenger?bus=${encodeURIComponent(bus.id)}`}
+          className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            available === 0
+              ? 'bg-gray-100 text-gray-400 cursor-not-allowed pointer-events-none'
+              : 'bg-blue-700 text-white hover:bg-blue-800'
+          }`}
+          aria-disabled={available === 0}
+        >
+          {available === 0 ? 'Full' : 'Board this matatu'}
+          {available > 0 && <ArrowRight className="w-3.5 h-3.5" />}
+        </Link>
+      </div>
     </div>
   )
 }
