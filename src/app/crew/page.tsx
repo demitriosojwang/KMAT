@@ -9,13 +9,6 @@
  *     confirm alightings, manage seat occupancy.
  *   - Driver: advance stops, toggle GPS tracking, see next-stop info,
  *     view on-board counters + route progress.
-<<<<<<< HEAD
- *
- * The driver and conductor are intentionally on the same page so a
- * single crew member can flip between roles on a small bus (a common
- * Kenyan small-SACCO reality where one person does both jobs).
-=======
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
  */
 import React, { useState } from 'react'
 import { UserCheck, Car, Bus, RotateCcw } from 'lucide-react'
@@ -33,14 +26,6 @@ export default function CrewPage() {
   const s = useSaccoSession()
   const [activeTab, setActiveTab] = useState<CrewTab>('conductor')
 
-<<<<<<< HEAD
-  // Track active tab in a ref-like way for the hook's GPS fleet refresh logic
-  // (the hook checks activeTabRef.current === 'admin' before refreshing fleet)
-  // — crew doesn't need fleet refresh, so we just leave it as 'crew'.
-
-  // ─── Loading ──────────────────────────────────────────────────
-=======
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
   if (s.auth.status === 'loading') {
     return (
       <div className="min-h-screen flex items-center justify-center bg-blue-50/50">
@@ -55,10 +40,6 @@ export default function CrewPage() {
     )
   }
 
-<<<<<<< HEAD
-  // ─── Unauthenticated → sign-in card ───────────────────────────
-=======
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
   if (s.auth.status === 'unauthenticated') {
     return (
       <SignInCard
@@ -74,10 +55,6 @@ export default function CrewPage() {
     )
   }
 
-<<<<<<< HEAD
-  // ─── Authenticated crew console ───────────────────────────────
-=======
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
   const tabs: { key: CrewTab; label: string; icon: React.ReactNode }[] = [
     { key: 'conductor', label: 'Conductor', icon: <UserCheck className="w-4 h-4" /> },
     { key: 'driver', label: 'Driver', icon: <Car className="w-4 h-4" /> },
@@ -94,10 +71,6 @@ export default function CrewPage() {
         onSignOut={s.handleSignOut}
       />
 
-<<<<<<< HEAD
-      {/* Tab bar */}
-=======
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
       <div className="bg-blue-800 text-white">
         <div className="max-w-5xl mx-auto px-4 pb-2 flex gap-1 overflow-x-auto">
           {tabs.map(tab => (
@@ -117,10 +90,6 @@ export default function CrewPage() {
         </div>
       </div>
 
-<<<<<<< HEAD
-      {/* Content */}
-=======
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
       <main className="flex-1 max-w-5xl w-full mx-auto px-4 py-6">
         <div key={activeTab} className="animate-in fade-in slide-in-from-bottom-3 duration-200">
           {activeTab === 'conductor' && (
@@ -153,10 +122,6 @@ export default function CrewPage() {
         </div>
       </main>
 
-<<<<<<< HEAD
-      {/* Footer */}
-=======
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
       <footer className="mt-auto border-t bg-white py-3">
         <div className="max-w-5xl mx-auto px-4 flex items-center justify-between text-xs text-gray-500">
           <span>© 2026 MatatuLink · Crew Console</span>

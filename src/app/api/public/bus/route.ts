@@ -7,19 +7,9 @@ import { withErrors } from "@/lib/api";
  *
  * Public (no auth) — returns the SAME shape as the authed /api/bus
  * endpoint (bus + active trip + transactions) so the PassengerPanel
-<<<<<<< HEAD
- * can be reused unchanged on the public /passenger route.
- *
- * Required: `busId` query param. Without it returns 400.
- *
- * No SACCO scoping is needed here — the bus ID is opaque (cuid) and
- * the response contains no PII beyond what a passenger standing at a
- * stage would see anyway (seat occupancy, route, GPS).
-=======
  * can be reused on the public landing page without modification.
  *
  * Required: `busId` query param. Without it returns 400.
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
  */
 export const GET = withErrors(async (req: Request) => {
   const url = new URL(req.url);

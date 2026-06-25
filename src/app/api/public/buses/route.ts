@@ -9,13 +9,6 @@ import { withErrors } from "@/lib/api";
  * passenger to pick one (route, registration, live GPS stamp, seat
  * availability). Passengers use this to find a matatu without signing
  * in to a crew/admin account.
-<<<<<<< HEAD
- *
- * Optional `?saccoId=` filter — if omitted, returns every bus across
- * every SACCO (still public — there is no PII here, just route + seat
- * counts).
-=======
->>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
  */
 export const GET = withErrors(async (req: Request) => {
   const url = new URL(req.url);
