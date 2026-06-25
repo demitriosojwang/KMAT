@@ -2,15 +2,8 @@
 
 /**
  * CrewAdminHeader — shared top bar for /crew and /admin.
- *
- * Renders:
- *   - MatatuLink logo + SACCO name + region
- *   - Active bus selector (when SACCO has >1 bus)
- *   - Section nav (Passenger / Crew / Admin) — highlights the active one
- *   - Sign out button
- *
- * The header does NOT own any state — it's a pure function of the
- * props the parent passes from useSaccoSession().
+ * Logo + SACCO name + section nav (Passenger/Crew/Admin) + bus
+ * selector + sign out.
  */
 import Link from 'next/link'
 import React from 'react'
@@ -51,7 +44,7 @@ export function CrewAdminHeader({
 
         <nav className="flex items-center gap-1 order-3 md:order-2 w-full md:w-auto">
           <Link
-            href="/passenger"
+            href="/"
             className="px-3 py-1.5 rounded-md text-xs font-medium text-blue-100 hover:bg-blue-700/50 hover:text-white transition-colors"
           >
             Passenger

@@ -1,13 +1,9 @@
 'use client'
 
 /**
- * SignInCard — the NextAuth credentials form, extracted from the old
- * single-page app. Used by both /crew and /admin when the visitor is
- * not yet signed in.
- *
- * Renders a list of demo accounts (returned by /api/me) as
- * click-to-prefill buttons, so a reviewer can sign in instantly
- * without remembering the seeded passwords.
+ * SignInCard — NextAuth credentials form, used by /crew and /admin
+ * when the visitor is not yet signed in. Renders demo-account
+ * click-to-prefill buttons from /api/me.
  */
 import React from 'react'
 import { LogIn, Mail, Lock, Bus } from 'lucide-react'
@@ -25,7 +21,6 @@ interface Props {
   signInLoading: boolean
   onSignIn: (e: React.FormEvent) => Promise<void>
   demoOwners: SaccoOwnerLite[]
-  /** Optional tagline shown under the MatatuLink logo */
   tagline?: string
 }
 

@@ -3,20 +3,12 @@
 /**
  * useSaccoSession — shared state hook for crew + admin pages.
  *
- * Encapsulates everything that the old single-page app did:
+ * Encapsulates everything the old single-page app did:
  *   - NextAuth session hydration (sign-in / sign-out)
  *   - SACCO bus list + selected bus state
  *   - Bus / Trip / GPS / Fleet data fetching
  *   - WebSocket lifecycle + bus-room join
  *   - Derived `stops`, `seats`, `currentStopIndex`, `passengersOnBoard`
- *
- * Returns null for `authState` while the session is still being
- * resolved — callers should render a loading spinner in that window.
- * Once resolved, `authState` is either:
- *   - `{ authenticated: false, demoOwners }` — caller renders the
- *     sign-in card.
- *   - `{ authenticated: true, ownerId, ownerMeta }` — caller renders
- *     the panel(s).
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { io, Socket } from 'socket.io-client'
@@ -75,7 +67,6 @@ export interface SaccoSessionState {
   refreshGpsData: () => Promise<void>
   refreshFleetData: () => Promise<void>
   handleReset: () => Promise<void>
-  // Sign-in helpers (used by the SignInCard)
   signInEmail: string
   signInPassword: string
   setSignInEmail: (v: string) => void
@@ -83,7 +74,6 @@ export interface SaccoSessionState {
   signInLoading: boolean
   handleSignIn: (e: React.FormEvent) => Promise<void>
   handleSignOut: () => Promise<void>
-  // Demo accounts (for sign-in card)
   demoOwners: SaccoOwnerLite[]
 }
 
@@ -94,7 +84,6 @@ export function useSaccoSession(): SaccoSessionState {
   const [auth, setAuth] = useState<AuthState>({ status: 'loading' })
   const [demoOwners, setDemoOwners] = useState<SaccoOwnerLite[]>([])
   const [ownerId, setOwnerId] = useState<string | null>(sessionOwnerId ?? null)
-  const [ownerMeta, setOwnerMeta] = useState<OwnerMeta | null>(null)
 
   const [busData, setBusData] = useState<BusData | null>(null)
   const [tripData, setTripData] = useState<TripData | null>(null)
@@ -112,10 +101,8 @@ export function useSaccoSession(): SaccoSessionState {
 
   const socketRef = useRef<Socket | null>(null)
   const busDataRef = useRef<BusData | null>(null)
-  const activeTabRef = useRef<string>('crew')
   const fetchFleetDataRef = useRef<(() => Promise<void>) | null>(null)
 
-  // ─── Fleet data fetching (for Admin panel) ────────────────────
   const refreshFleetData = useCallback(async () => {
     try {
       const qs = ownerId ? `?ownerId=${encodeURIComponent(ownerId)}` : ''
@@ -130,7 +117,6 @@ export function useSaccoSession(): SaccoSessionState {
   useEffect(() => { fetchFleetDataRef.current = refreshFleetData }, [refreshFleetData])
   useEffect(() => { busDataRef.current = busData }, [busData])
 
-  // ─── Data fetching ────────────────────────────────────────────
   const refreshBusData = useCallback(async () => {
     try {
       const params = new URLSearchParams()
@@ -188,7 +174,6 @@ export function useSaccoSession(): SaccoSessionState {
         if (data.demoOwners?.length) setDemoOwners(data.demoOwners)
         if (data.authenticated && data.owner?.id) {
           setOwnerId(data.owner.id)
-          setOwnerMeta({ saccoName: data.sacco.name, region: data.sacco.region })
           setAuth({
             status: 'authenticated',
             ownerId: data.owner.id,
@@ -207,7 +192,7 @@ export function useSaccoSession(): SaccoSessionState {
     load()
   }, [])
 
-  // Whenever NextAuth session changes (login / logout), re-sync.
+  // Sync with NextAuth session changes
   useEffect(() => {
     if (sessionOwnerId) {
       setOwnerId(sessionOwnerId)
@@ -220,7 +205,6 @@ export function useSaccoSession(): SaccoSessionState {
     }
   }, [sessionOwnerId, status])
 
-  // ─── Sign-in handler ──────────────────────────────────────────
   const handleSignIn = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
     if (!signInEmail || !signInPassword) {
@@ -257,7 +241,6 @@ export function useSaccoSession(): SaccoSessionState {
     toast.info('Signed out')
   }, [demoOwners])
 
-  // ─── Reset demo data ──────────────────────────────────────────
   const handleReset = useCallback(async () => {
     try {
       await fetch('/api/seed', { method: 'POST' })
@@ -268,7 +251,7 @@ export function useSaccoSession(): SaccoSessionState {
     }
   }, [refreshBusData])
 
-  // ─── Load bus list when ownerId changes ───────────────────────
+  // Load bus list when ownerId changes
   useEffect(() => {
     if (!ownerId) return
     const loadSacco = async () => {
@@ -289,7 +272,6 @@ export function useSaccoSession(): SaccoSessionState {
           if (!selectedBusId || !simplified.find((b: BusListItem) => b.id === selectedBusId)) {
             setSelectedBusId(simplified[0]?.id ?? null)
           }
-          setOwnerMeta({ saccoName: data.sacco.name, region: data.sacco.region })
         }
       } catch (e) {
         console.error('Failed to fetch buses for SACCO', e)
@@ -298,7 +280,7 @@ export function useSaccoSession(): SaccoSessionState {
     loadSacco()
   }, [ownerId])
 
-  // When selectedBusId changes, refetch bus/trip/gps data + rejoin WS room
+  // When selectedBusId changes, refetch + rejoin WS room
   useEffect(() => {
     if (selectedBusId) {
       refreshBusData().then(() => refreshGpsData())
@@ -308,7 +290,7 @@ export function useSaccoSession(): SaccoSessionState {
     }
   }, [selectedBusId, ownerId])
 
-  // ─── WebSocket lifecycle ──────────────────────────────────────
+  // WebSocket lifecycle
   useEffect(() => {
     const socket = io('/?XTransformPort=3003', {
       transports: ['websocket', 'polling'],
@@ -365,9 +347,7 @@ export function useSaccoSession(): SaccoSessionState {
         lastUpdated: data.timestamp,
         gpsHistory: [...prev.gpsHistory, { lat: data.lat, lng: data.lng, speed: data.speed, heading: data.heading, timestamp: data.timestamp }].slice(-20),
       } : prev)
-      if (activeTabRef.current === 'admin') {
-        fetchFleetDataRef.current?.()
-      }
+      fetchFleetDataRef.current?.()
     })
 
     socket.on('geofence_event', (data: { type: string; stopIndex: number; stopName?: string; timestamp: string }) => {
@@ -396,7 +376,6 @@ export function useSaccoSession(): SaccoSessionState {
     }
   }, [busData?.id])
 
-  // ─── Derived data ─────────────────────────────────────────────
   const stops: Stop[] = busData?.route?.stops || []
   const seats: Seat[] = busData?.seats || []
   const currentStopIndex = tripData?.currentStopIndex || 0
@@ -404,32 +383,14 @@ export function useSaccoSession(): SaccoSessionState {
 
   return {
     auth,
-    busData,
-    tripData,
-    transactions,
-    notifications,
-    gpsData,
-    fleetData,
-    busList,
-    selectedBusId,
-    setSelectedBusId,
-    stops,
-    seats,
-    currentStopIndex,
-    passengersOnBoard,
+    busData, tripData, transactions, notifications, gpsData, fleetData,
+    busList, selectedBusId, setSelectedBusId,
+    stops, seats, currentStopIndex, passengersOnBoard,
     emitSocket,
-    refreshBusData,
-    refreshTripData,
-    refreshGpsData,
-    refreshFleetData,
+    refreshBusData, refreshTripData, refreshGpsData, refreshFleetData,
     handleReset,
-    signInEmail,
-    signInPassword,
-    setSignInEmail,
-    setSignInPassword,
-    signInLoading,
-    handleSignIn,
-    handleSignOut,
+    signInEmail, signInPassword, setSignInEmail, setSignInPassword,
+    signInLoading, handleSignIn, handleSignOut,
     demoOwners,
   }
 }

@@ -9,9 +9,12 @@ import { withErrors } from "@/lib/api";
  * "Find your matatu" SACCO picker. Returns every SACCO with a count
  * of active buses and the region, so passengers can browse without
  * signing in.
+<<<<<<< HEAD
  *
  * The passenger flow intentionally does NOT need owner credentials —
  * a rider just wants to see "which matatus are running right now".
+=======
+>>>>>>> 26416a0 (Restructure: passenger-first landing + crew + admin interfaces)
  */
 export const GET = withErrors(async () => {
   const saccos = await db.sACCO.findMany({
